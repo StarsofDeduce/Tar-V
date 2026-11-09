@@ -6,9 +6,20 @@ let isBatchMode = false;
 let selectedItemsForBatch = new Set();
 let draggedItemId = null;
 let draggedTabId = null;
-const ICON_EXTRACTOR_VERSION = 2;
+const ICON_EXTRACTOR_VERSION = 3;
 const runtimeIconCache = new Map();
 const runtimeIconLoads = new Map();
+let persistedConfig = null;
+let contextMenuTrigger = null;
+
+function cloneConfig(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function acceptCanonicalConfig(value) {
+  config = value;
+  persistedConfig = cloneConfig(value);
+}
 
 function isProtocolPath(value) {
   return typeof value === 'string' && /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
@@ -23,11 +34,11 @@ function iconRequestFromItem(item) {
   };
 }
 
-function applyIconMetadata(item, request) {
+function applyIconMetadata(item, request, iconResult = null) {
   item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
-  item.iconVersion = ICON_EXTRACTOR_VERSION;
+  item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
   item.icon = '';
 }
 
@@ -35,10 +46,10 @@ async function loadItemIcon(item, { forceRefresh = false } = {}) {
   if (runtimeIconLoads.has(item.id)) return runtimeIconLoads.get(item.id);
   const promise = (async () => {
     const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
-    const iconUrl = await window.api.getFileIcon(request, forceRefresh);
-    runtimeIconCache.set(item.id, iconUrl);
-    applyIconMetadata(item, request);
-    return iconUrl;
+    const iconResult = await window.api.getFileIcon(request, forceRefresh);
+    runtimeIconCache.set(item.id, iconResult.url);
+    applyIconMetadata(item, request, iconResult);
+    return iconResult.url;
   })().finally(() => runtimeIconLoads.delete(item.id));
   runtimeIconLoads.set(item.id, promise);
   return promise;
@@ -51,12 +62,12 @@ async function migrateLegacyIconsInBackground() {
     try {
       await loadItemIcon(item, { forceRefresh: true });
       changed++;
-      if (changed % 10 === 0) await window.api.saveConfig(config);
+      if (changed % 10 === 0) await persistCurrentConfig({ showError: false });
     } catch (err) {
       console.error('Background icon migration failed:', item.name, err);
     }
   }
-  if (changed > 0) await window.api.saveConfig(config);
+  if (changed > 0) await persistCurrentConfig({ showError: false });
 }
 
 // Dictionary for multi-language translation (Req 34)
@@ -87,7 +98,25 @@ const TRANSLATIONS = {
     alertFolderEmpty: "所选文件夹是空的，未找到任何文件项目。",
     alertImportSuccess: "成功在当前分组中导入 {count} 个快捷启动项！",
     confirmDeleteItem: "确定要删除快捷项 \"{name}\" 吗？",
-    alertLaunchFail: "启动失败: ",
+    alertLaunchFail: "启动失败：",
+    alertSaveFail: "保存失败：",
+    launchErrorTitle: "无法打开项目",
+    launch_ITEM_NOT_FOUND: "该项目尚未成功保存，请重新添加。",
+    launch_EMPTY_PATH: "该项目没有有效的启动路径。",
+    launch_PATH_NOT_FOUND: "启动文件可能已移动、更新或卸载。",
+    launch_ACCESS_DENIED: "系统拒绝访问该启动项。",
+    launch_UAC_CANCELLED: "已取消管理员权限请求。",
+    launch_PROTOCOL_BLOCKED: "出于安全原因，该协议不能启动。",
+    launch_SYSTEM_LAUNCH_FAILED: "Windows 无法启动该项目。",
+    launch_NO_LOCAL_LOCATION: "该启动项没有可显示的本地文件位置。",
+    launch_GENERIC: "启动时发生未知错误。",
+    repairSearchPrompt: "是否查找该软件的新位置？",
+    repairCandidatePrompt: "找到一个可信的新位置，确认修复吗？\n\n旧路径：{old}\n新路径：{next}",
+    repairNotFoundPrompt: "没有找到唯一可信的新位置。是否手动重新选择文件？",
+    repairSuccess: "启动路径和图标来源已修复。",
+    repairFailed: "修复失败：",
+    repairAction: "查找并修复",
+    manualRelocateAction: "重新选择文件",
     
     // Modals
     editTitleAdd: "添加快捷项目",
@@ -159,6 +188,24 @@ const TRANSLATIONS = {
     alertImportSuccess: "Successfully imported {count} items into the current tab!",
     confirmDeleteItem: "Are you sure you want to delete shortcut \"{name}\"?",
     alertLaunchFail: "Failed to launch: ",
+    alertSaveFail: "Failed to save: ",
+    launchErrorTitle: "Unable to Open Item",
+    launch_ITEM_NOT_FOUND: "This item was not saved successfully. Please add it again.",
+    launch_EMPTY_PATH: "This item does not have a valid launch path.",
+    launch_PATH_NOT_FOUND: "The launch file may have moved, updated, or been uninstalled.",
+    launch_ACCESS_DENIED: "Windows denied access to this item.",
+    launch_UAC_CANCELLED: "The administrator permission request was cancelled.",
+    launch_PROTOCOL_BLOCKED: "This protocol is blocked for security reasons.",
+    launch_SYSTEM_LAUNCH_FAILED: "Windows could not start this item.",
+    launch_NO_LOCAL_LOCATION: "This item does not have a local file location to show.",
+    launch_GENERIC: "An unknown launch error occurred.",
+    repairSearchPrompt: "Search for the application's new location?",
+    repairCandidatePrompt: "A trusted new location was found. Apply this repair?\n\nOld path: {old}\nNew path: {next}",
+    repairNotFoundPrompt: "No unique trusted location was found. Select the file manually?",
+    repairSuccess: "The launch path and icon source were repaired.",
+    repairFailed: "Repair failed: ",
+    repairAction: "Find and Repair",
+    manualRelocateAction: "Select File",
     
     // Modals
     editTitleAdd: "Add Shortcut",
@@ -401,19 +448,23 @@ let saveConfigTimeout = null;
 function debouncedSaveConfig() {
   if (saveConfigTimeout) clearTimeout(saveConfigTimeout);
   saveConfigTimeout = setTimeout(() => {
-    window.api.saveConfig(config);
+    persistCurrentConfig({ showError: false });
   }, 1000);
 }
 
 // Custom Alert Modal
-function showCustomAlert(message) {
+function showCustomAlert(message, { title = null } = {}) {
   return new Promise((resolve) => {
     const dialogModal = document.getElementById('dialog-modal');
+    const dialogTitle = document.getElementById('dialog-title');
     const dialogMessage = document.getElementById('dialog-message');
     const confirmBtn = document.getElementById('dialog-confirm-btn');
     const cancelBtn = document.getElementById('dialog-cancel-btn');
     const closeX = document.getElementById('dialog-close-x');
     
+    const lang = config && config.settings ? (config.settings.language || 'zh') : 'zh';
+    const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    dialogTitle.textContent = title || (lang === 'zh' ? '提示' : 'Notice');
     dialogMessage.textContent = message;
     cancelBtn.style.display = 'none';
     dialogModal.style.display = 'flex';
@@ -423,26 +474,39 @@ function showCustomAlert(message) {
       cancelBtn.style.display = 'inline-block';
       confirmBtn.removeEventListener('click', onConfirm);
       closeX.removeEventListener('click', onConfirm);
+      document.removeEventListener('keydown', onKeyDown);
+      confirmBtn.textContent = t.btnConfirm;
       resolve();
     };
     
     const onConfirm = () => cleanUp();
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' || event.key === 'Enter') cleanUp();
+    };
     
     confirmBtn.addEventListener('click', onConfirm);
     closeX.addEventListener('click', onConfirm);
+    document.addEventListener('keydown', onKeyDown);
+    requestAnimationFrame(() => confirmBtn.focus());
   });
 }
 
 // Custom Confirm Modal
-function showCustomConfirm(message) {
+function showCustomConfirm(message, { title = null, confirmLabel = null, cancelLabel = null } = {}) {
   return new Promise((resolve) => {
     const dialogModal = document.getElementById('dialog-modal');
+    const dialogTitle = document.getElementById('dialog-title');
     const dialogMessage = document.getElementById('dialog-message');
     const confirmBtn = document.getElementById('dialog-confirm-btn');
     const cancelBtn = document.getElementById('dialog-cancel-btn');
     const closeX = document.getElementById('dialog-close-x');
     
+    const lang = config && config.settings ? (config.settings.language || 'zh') : 'zh';
+    const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    dialogTitle.textContent = title || (lang === 'zh' ? '提示' : 'Notice');
     dialogMessage.textContent = message;
+    confirmBtn.textContent = confirmLabel || t.btnConfirm;
+    cancelBtn.textContent = cancelLabel || t.btnCancel;
     cancelBtn.style.display = 'inline-block';
     dialogModal.style.display = 'flex';
     
@@ -451,16 +515,166 @@ function showCustomConfirm(message) {
       confirmBtn.removeEventListener('click', onConfirm);
       cancelBtn.removeEventListener('click', onCancel);
       closeX.removeEventListener('click', onCancel);
+      document.removeEventListener('keydown', onKeyDown);
+      confirmBtn.textContent = t.btnConfirm;
+      cancelBtn.textContent = t.btnCancel;
       resolve(value);
     };
     
     const onConfirm = () => cleanUp(true);
     const onCancel = () => cleanUp(false);
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') onCancel();
+      if (event.key === 'Enter') onConfirm();
+    };
     
     confirmBtn.addEventListener('click', onConfirm);
     cancelBtn.addEventListener('click', onCancel);
     closeX.addEventListener('click', onCancel);
+    document.addEventListener('keydown', onKeyDown);
+    requestAnimationFrame(() => confirmBtn.focus());
   });
+}
+
+async function persistCurrentConfig({ showError = true } = {}) {
+  const saved = await window.api.saveConfig(config);
+  if (saved && saved.success) {
+    acceptCanonicalConfig(saved.config || config);
+    return true;
+  }
+
+  if (persistedConfig) {
+    config = cloneConfig(persistedConfig);
+    if (!config.tabs.some((tab) => tab.id === activeTabId)) {
+      activeTabId = config.tabs.length > 0 ? config.tabs[0].id : null;
+    }
+    if (tabsList && itemsGrid) {
+      renderTabs();
+      renderItems(searchInput ? searchInput.value : '');
+    }
+  }
+  if (showError) {
+    const lang = config && config.settings ? (config.settings.language || 'zh') : 'zh';
+    const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    await showCustomAlert(t.alertSaveFail + (saved && (saved.message || saved.error) || t.launch_GENERIC));
+  }
+  return false;
+}
+
+function launchErrorText(result) {
+  const lang = config.settings.language || 'zh';
+  const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+  const code = result && result.code ? result.code : 'GENERIC';
+  const reason = t[`launch_${code}`] || t.launch_GENERIC;
+  const failedPath = result && result.details && result.details.path;
+  return failedPath ? `${reason}\n\n${failedPath}` : reason;
+}
+
+async function manuallyRelocateItem(itemId) {
+  const selectedPath = await window.api.selectFile();
+  if (!selectedPath) return false;
+
+  const draftItem = config.items.find((item) => item.id === itemId);
+  if (!draftItem) return false;
+
+  let targetPath = selectedPath;
+  let targetArgs = draftItem.args || '';
+  let shortcutDetails = null;
+  if (/\.(lnk|url)$/i.test(selectedPath)) {
+    shortcutDetails = await window.api.resolveShortcut(selectedPath);
+    if (!shortcutDetails || !shortcutDetails.target) return false;
+    targetPath = shortcutDetails.target;
+    targetArgs = shortcutDetails.args || '';
+  }
+
+  const iconRequest = await window.api.resolveIconRequest({
+    path: targetPath,
+    shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
+    iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
+    iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
+  });
+  const iconResult = await window.api.getFileIcon(iconRequest, true);
+  draftItem.path = targetPath;
+  draftItem.args = targetArgs;
+  applyIconMetadata(draftItem, iconRequest, iconResult);
+  runtimeIconCache.set(draftItem.id, iconResult.url);
+
+  if (!await persistCurrentConfig()) {
+    renderItems();
+    return false;
+  }
+  renderItems();
+  return true;
+}
+
+async function repairMissingItem(itemId) {
+  const lang = config.settings.language || 'zh';
+  const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+  const result = await window.api.findItemRepair(itemId);
+
+  if (result && result.success) {
+    const candidate = result.candidate;
+    const approved = await showCustomConfirm(
+      t.repairCandidatePrompt.replace('{old}', candidate.oldPath || '').replace('{next}', candidate.newPath || ''),
+      { title: t.launchErrorTitle, confirmLabel: t.repairAction }
+    );
+    if (!approved) return false;
+
+    const applied = await window.api.applyItemRepair(itemId, result.token);
+    if (!applied || !applied.success) {
+      await showCustomAlert(t.repairFailed + (applied && applied.message || t.launch_GENERIC), { title: t.launchErrorTitle });
+      return false;
+    }
+
+    acceptCanonicalConfig(applied.config);
+    const repairedItem = config.items.find((item) => item.id === itemId);
+    if (repairedItem) {
+      try {
+        await loadItemIcon(repairedItem, { forceRefresh: true });
+        await persistCurrentConfig({ showError: false });
+      } catch (error) {
+        console.error('Failed to refresh repaired icon:', error);
+      }
+    }
+    renderTabs();
+    renderItems();
+    await showCustomAlert(t.repairSuccess);
+    return true;
+  }
+
+  if (result && result.code && result.code !== 'NO_REPAIR_CANDIDATE') {
+    await showCustomAlert(t.repairFailed + (result.message || t.launch_GENERIC), { title: t.launchErrorTitle });
+    return false;
+  }
+
+  const manual = await showCustomConfirm(t.repairNotFoundPrompt, {
+    title: t.launchErrorTitle,
+    confirmLabel: t.manualRelocateAction
+  });
+  if (!manual) return false;
+  const repaired = await manuallyRelocateItem(itemId);
+  if (repaired) await showCustomAlert(t.repairSuccess);
+  return repaired;
+}
+
+async function handleLaunchFailure(itemId, result) {
+  const lang = config.settings.language || 'zh';
+  const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+  if (result && result.code === 'PATH_NOT_FOUND') {
+    const shouldRepair = await showCustomConfirm(
+      `${launchErrorText(result)}\n\n${t.repairSearchPrompt}`,
+      { title: t.launchErrorTitle, confirmLabel: t.repairAction }
+    );
+    if (shouldRepair) await repairMissingItem(itemId);
+    return;
+  }
+  await showCustomAlert(launchErrorText(result), { title: t.launchErrorTitle });
+}
+
+async function launchConfiguredItem(itemId, forceRunAsAdmin = false) {
+  const result = await window.api.launchItem(itemId, forceRunAsAdmin);
+  if (!result || !result.success) await handleLaunchFailure(itemId, result || { code: 'GENERIC' });
+  return Boolean(result && result.success);
 }
 
 // Custom Prompt Modal
@@ -503,7 +717,7 @@ function showCustomPrompt(message, defaultValue = '') {
 
 // Initialize the app
 async function init() {
-  config = await window.api.getConfig();
+  acceptCanonicalConfig(await window.api.getConfig());
   
   mergeDefaultSettings();
   
@@ -740,6 +954,7 @@ function renderTabs() {
     tabEl.className = `tab-item ${tab.id === activeTabId ? 'active' : ''}`;
     tabEl.textContent = tab.name;
     tabEl.dataset.id = tab.id;
+    tabEl.tabIndex = 0;
     
     tabEl.addEventListener('click', () => {
       activeTabId = tab.id;
@@ -808,8 +1023,7 @@ function renderTabs() {
         config.tabs.splice(draggedIdx, 1);
         config.tabs.splice(targetIdx, 0, draggedTab);
         
-        await window.api.saveConfig(config);
-        renderTabs();
+        if (await persistCurrentConfig()) renderTabs();
       }
       draggedTabId = null;
     });
@@ -858,6 +1072,7 @@ async function renderItems(query = '') {
     const card = document.createElement('div');
     card.className = `grid-item ${isBatchMode ? 'batch-mode-item' : ''} ${isBatchMode && selectedItemsForBatch.has(item.id) ? 'batch-selected' : ''}`;
     card.dataset.id = item.id;
+    card.tabIndex = 0;
 
     if (isBatchMode) {
       const chk = document.createElement('input');
@@ -918,15 +1133,7 @@ async function renderItems(query = '') {
       });
     }
 
-    const launchHandler = () => {
-      const lang = config.settings.language || 'zh';
-      const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
-      window.api.launchItem(item.id).then(res => {
-        if (res && !res.success) {
-          showCustomAlert(t.alertLaunchFail + (res.error || ''));
-        }
-      });
-    };
+    const launchHandler = () => launchConfiguredItem(item.id);
 
     if (isBatchMode) {
       card.addEventListener('click', (e) => {
@@ -1023,9 +1230,69 @@ function updateBatchActionBar() {
   }
 }
 
-function positionAndShowContextMenu(x, y) {
+const CONTEXT_ICONS = {
+  play: '<path d="M6 4.8v14.4L18 12 6 4.8z"/>',
+  shield: '<path d="M12 3l7 3v5c0 4.6-2.8 8-7 10-4.2-2-7-5.4-7-10V6l7-3z"/><path d="M9.5 12l1.7 1.7 3.6-3.8"/>',
+  folder: '<path d="M3 6.5h7l2 2h9v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5z"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  edit: '<path d="M4 20h4l11-11-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  tag: '<path d="M3 12l9 9 9-9-9-9H5a2 2 0 0 0-2 2v7z"/><path d="M8 8h.01"/>',
+  import: '<path d="M3 6.5h7l2 2h9v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5z"/><path d="M12 11v6M9.5 14.5L12 17l2.5-2.5"/>',
+  sort: '<path d="M4 7h10M4 12h7M4 17h4M17 5v14M14.5 16.5L17 19l2.5-2.5"/>',
+  clean: '<path d="M4 16l8-12 8 5-8 12H7l-3-5z"/><path d="M9.5 14h7"/>'
+};
+
+function createContextIcon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'context-icon');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.innerHTML = CONTEXT_ICONS[name] || CONTEXT_ICONS.list;
+  return svg;
+}
+
+function buildContextMenu(items) {
+  contextMenu.replaceChildren();
+  for (const item of items) {
+    if (item.separator) {
+      const divider = document.createElement('div');
+      divider.className = 'divider';
+      divider.setAttribute('role', 'separator');
+      contextMenu.appendChild(divider);
+      continue;
+    }
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `context-item${item.danger ? ' text-danger' : ''}`;
+    button.dataset.action = item.action;
+    button.setAttribute('role', 'menuitem');
+    button.disabled = Boolean(item.disabled);
+    button.appendChild(createContextIcon(item.icon));
+
+    const label = document.createElement('span');
+    label.textContent = item.label;
+    button.appendChild(label);
+    contextMenu.appendChild(button);
+  }
+}
+
+function closeContextMenu({ restoreFocus = false } = {}) {
+  contextMenu.style.display = 'none';
+  contextMenu.setAttribute('aria-hidden', 'true');
+  if (restoreFocus && contextMenuTrigger && contextMenuTrigger.isConnected) {
+    contextMenuTrigger.focus({ preventScroll: true });
+  }
+  contextMenuTrigger = null;
+}
+
+function positionAndShowContextMenu(x, y, trigger) {
+  contextMenuTrigger = trigger || document.activeElement;
   contextMenu.style.display = 'block';
-  const menuWidth = contextMenu.offsetWidth || 170;
+  contextMenu.setAttribute('aria-hidden', 'false');
+  const menuWidth = contextMenu.offsetWidth || 224;
   const menuHeight = contextMenu.offsetHeight || 200;
   const windowWidth = window.innerWidth;
   const windowHeight = window.innerHeight;
@@ -1044,96 +1311,57 @@ function positionAndShowContextMenu(x, y) {
   
   contextMenu.style.left = `${adjustedX}px`;
   contextMenu.style.top = `${adjustedY}px`;
+  const firstItem = contextMenu.querySelector('.context-item:not(:disabled)');
+  if (firstItem) firstItem.focus({ preventScroll: true });
 }
 
-function showCardContextMenu(itemId, x, y) {
+function showCardContextMenu(itemId, x, y, trigger) {
   selectedItemId = itemId;
-  
-  contextMenu.innerHTML = `
-    <div class="context-item" data-action="open">
-      <span class="icon">🚀</span> 打开
-    </div>
-    <div class="context-item" data-action="admin">
-      <span class="icon">🛡️</span> 以管理员身份运行
-    </div>
-    <div class="context-item" data-action="location">
-      <span class="icon">📂</span> 打开文件位置
-    </div>
-    <div class="divider"></div>
-    <div class="context-item" data-action="batch-mode-item-menu">
-      <span class="icon">☑️</span> 批量选择/管理...
-    </div>
-    <div class="context-item" data-action="edit">
-      <span class="icon">✏️</span> 编辑属性
-    </div>
-    <div class="context-item text-danger" data-action="delete">
-      <span class="icon">❌</span> 删除快捷方式
-    </div>
-  `;
-  
+  const lang = config.settings.language || 'zh';
+  const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
   const item = config.items.find(i => i.id === itemId);
-  if (item) {
-    const isExe = item.path && (item.path.endsWith('.exe') || item.path.endsWith('.bat') || item.path.endsWith('.cmd'));
-    contextMenu.querySelector('[data-action="admin"]').style.display = isExe ? 'flex' : 'none';
-    
-    const isUrl = isProtocolPath(item.path);
-    contextMenu.querySelector('[data-action="location"]').style.display = isUrl ? 'none' : 'flex';
-  }
-  
-  positionAndShowContextMenu(x, y);
+  if (!item) return;
+  const isExe = /\.(exe|bat|cmd)$/i.test(item.path || '');
+  const isUrl = isProtocolPath(item.path);
+  const menuItems = [
+    { action: 'open', icon: 'play', label: t.ctxOpen },
+    ...(isExe ? [{ action: 'admin', icon: 'shield', label: t.ctxAdmin }] : []),
+    ...(!isUrl ? [{ action: 'location', icon: 'folder', label: t.ctxLocation }] : []),
+    { separator: true },
+    { action: 'batch-mode-item-menu', icon: 'list', label: t.ctxBatch },
+    { action: 'edit', icon: 'edit', label: t.ctxEdit },
+    { action: 'delete', icon: 'trash', label: t.ctxDelete, danger: true }
+  ];
+  buildContextMenu(menuItems);
+  positionAndShowContextMenu(x, y, trigger);
 }
 
-function showTabContextMenu(tabId, x, y) {
+function showTabContextMenu(tabId, x, y, trigger) {
   selectedItemId = tabId;
   const lang = config.settings.language || 'zh';
   const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
-  
-  contextMenu.innerHTML = `
-    <div class="context-item" data-action="rename-tab">
-      <span class="icon">✏️</span> ${t.ctxTabRename}
-    </div>
-    <div class="context-item text-danger" data-action="delete-tab">
-      <span class="icon">❌</span> ${t.ctxTabDelete}
-    </div>
-  `;
-  positionAndShowContextMenu(x, y);
+  buildContextMenu([
+    { action: 'rename-tab', icon: 'edit', label: t.ctxTabRename },
+    { action: 'delete-tab', icon: 'trash', label: t.ctxTabDelete, danger: true }
+  ]);
+  positionAndShowContextMenu(x, y, trigger);
 }
 
-function showBackgroundContextMenu(x, y) {
+function showBackgroundContextMenu(x, y, trigger) {
   selectedItemId = null;
   const lang = config.settings.language || 'zh';
   const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
-  
-  contextMenu.innerHTML = `
-    <div class="context-item" data-action="add-item">
-      <span class="icon">➕</span> ${t.ctxBgAdd}
-    </div>
-    <div class="context-item" data-action="add-tab-bg">
-      <span class="icon">🏷️</span> ${t.ctxBgAddTab}
-    </div>
-    <div class="context-item" data-action="import-folder-bg">
-      <span class="icon">📁</span> ${t.ctxBgImportFolder}
-    </div>
-    <div class="context-item" data-action="batch-mode-bg">
-      <span class="icon">☑️</span> ${t.ctxBgBatch}
-    </div>
-    <div class="divider"></div>
-    <div class="context-item" data-action="sort-tab-bg">
-      <span class="icon">↕️</span> ${t.ctxBgSort}
-    </div>
-    <div class="context-item" data-action="clean-tab-dup-bg">
-      <span class="icon">🧹</span> ${t.ctxBgClean}
-    </div>
-  `;
-  
-  if (config.tabs.length === 0) {
-    contextMenu.querySelector('[data-action="add-item"]').style.opacity = '0.5';
-    contextMenu.querySelector('[data-action="add-item"]').style.pointerEvents = 'none';
-    contextMenu.querySelector('[data-action="import-folder-bg"]').style.opacity = '0.5';
-    contextMenu.querySelector('[data-action="import-folder-bg"]').style.pointerEvents = 'none';
-  }
-
-  positionAndShowContextMenu(x, y);
+  const noTabs = config.tabs.length === 0;
+  buildContextMenu([
+    { action: 'add-item', icon: 'plus', label: t.ctxBgAdd, disabled: noTabs },
+    { action: 'add-tab-bg', icon: 'tag', label: t.ctxBgAddTab },
+    { action: 'import-folder-bg', icon: 'import', label: t.ctxBgImportFolder, disabled: noTabs },
+    { action: 'batch-mode-bg', icon: 'list', label: t.ctxBgBatch, disabled: noTabs },
+    { separator: true },
+    { action: 'sort-tab-bg', icon: 'sort', label: t.ctxBgSort, disabled: noTabs },
+    { action: 'clean-tab-dup-bg', icon: 'clean', label: t.ctxBgClean, disabled: noTabs }
+  ]);
+  positionAndShowContextMenu(x, y, trigger);
 }
 
 async function addNewTab() {
@@ -1147,7 +1375,7 @@ async function addNewTab() {
   config.tabs.push({ id: id, name: name.trim() });
   activeTabId = id;
   
-  await window.api.saveConfig(config);
+  if (!await persistCurrentConfig()) return;
   renderTabs();
   renderItems();
 }
@@ -1162,7 +1390,7 @@ async function renameTab(tabId) {
   if (!name || name.trim() === '' || name.trim() === tab.name) return;
   
   tab.name = name.trim();
-  await window.api.saveConfig(config);
+  if (!await persistCurrentConfig()) return;
   renderTabs();
 }
 
@@ -1183,7 +1411,7 @@ async function deleteTab(tabId) {
     activeTabId = config.tabs.length > 0 ? config.tabs[0].id : null;
   }
   
-  await window.api.saveConfig(config);
+  if (!await persistCurrentConfig()) return;
   renderTabs();
   renderItems();
 }
@@ -1237,8 +1465,8 @@ async function batchImportFolder() {
       iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
       iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
     });
-    const iconDataUrl = await window.api.getFileIcon(iconRequest);
-    runtimeIconCache.set(itemId, iconDataUrl);
+    const iconResult = await window.api.getFileIcon(iconRequest);
+    runtimeIconCache.set(itemId, iconResult.url);
 
     config.items.push({
       id: itemId,
@@ -1251,12 +1479,12 @@ async function batchImportFolder() {
       shortcutPath: iconRequest.shortcutPath || '',
       iconPath: iconRequest.iconPath || '',
       iconIndex: iconRequest.iconIndex || 0,
-      iconVersion: ICON_EXTRACTOR_VERSION
+      iconVersion: iconResult.fallback ? 0 : ICON_EXTRACTOR_VERSION
     });
     count++;
   }
   
-  await window.api.saveConfig(config);
+  if (!await persistCurrentConfig()) return;
   renderItems();
   await showCustomAlert(t.alertImportSuccess.replace('{count}', count));
 }
@@ -1317,7 +1545,7 @@ async function saveItemDetails() {
     iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
     iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
   });
-  const iconDataUrl = await window.api.getFileIcon(iconRequest, true);
+  const iconResult = await window.api.getFileIcon(iconRequest, true);
 
   if (selectedItemId) {
     const item = config.items.find(i => i.id === selectedItemId);
@@ -1326,8 +1554,8 @@ async function saveItemDetails() {
       item.path = targetPath;
       item.args = targetArgs;
       item.runAsAdmin = admin;
-      applyIconMetadata(item, iconRequest);
-      runtimeIconCache.set(item.id, iconDataUrl);
+      applyIconMetadata(item, iconRequest, iconResult);
+      runtimeIconCache.set(item.id, iconResult.url);
     }
   } else {
     const itemId = 'item-' + Date.now();
@@ -1340,12 +1568,15 @@ async function saveItemDetails() {
       runAsAdmin: admin,
       icon: ''
     };
-    applyIconMetadata(newItem, iconRequest);
-    runtimeIconCache.set(itemId, iconDataUrl);
+    applyIconMetadata(newItem, iconRequest, iconResult);
+    runtimeIconCache.set(itemId, iconResult.url);
     config.items.push(newItem);
   }
   
-  await window.api.saveConfig(config);
+  if (!await persistCurrentConfig()) {
+    renderItems();
+    return;
+  }
   editModal.style.display = 'none';
   renderItems();
 }
@@ -1503,8 +1734,7 @@ function setupEventListeners() {
       config.items.splice(newTargetIdx, 0, draggedItem);
     }
     
-    await window.api.saveConfig(config);
-    renderItems();
+    if (await persistCurrentConfig()) renderItems();
   });
 
   document.getElementById('browse-file-btn').addEventListener('click', async () => {
@@ -1537,29 +1767,53 @@ function setupEventListeners() {
     const tab = e.target.closest('.tab-item');
     const isGrid = e.target.closest('.grid-container');
     const isTabs = e.target.closest('.tabs-container');
+    const trigger = card || tab || isGrid || isTabs;
+    const triggerRect = trigger ? trigger.getBoundingClientRect() : null;
+    const menuX = e.clientX || (triggerRect ? triggerRect.left + 12 : 12);
+    const menuY = e.clientY || (triggerRect ? triggerRect.top + 12 : 12);
     
     if (card) {
       e.preventDefault();
-      showCardContextMenu(card.dataset.id, e.clientX, e.clientY);
+      showCardContextMenu(card.dataset.id, menuX, menuY, card);
     } else if (tab) {
       e.preventDefault();
-      showTabContextMenu(tab.dataset.id, e.clientX, e.clientY);
+      showTabContextMenu(tab.dataset.id, menuX, menuY, tab);
     } else if (isGrid || isTabs) {
       e.preventDefault();
-      showBackgroundContextMenu(e.clientX, e.clientY);
+      showBackgroundContextMenu(menuX, menuY, trigger);
     }
   });
 
-  document.addEventListener('click', () => {
-    contextMenu.style.display = 'none';
+  document.addEventListener('pointerdown', (event) => {
+    if (contextMenu.style.display !== 'none' && !contextMenu.contains(event.target)) {
+      closeContextMenu({ restoreFocus: true });
+    }
+  });
+
+  contextMenu.addEventListener('keydown', (event) => {
+    const enabledItems = Array.from(contextMenu.querySelectorAll('.context-item:not(:disabled)'));
+    if (enabledItems.length === 0) return;
+    const currentIndex = enabledItems.indexOf(document.activeElement);
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowDown') nextIndex = (currentIndex + 1 + enabledItems.length) % enabledItems.length;
+    else if (event.key === 'ArrowUp') nextIndex = (currentIndex - 1 + enabledItems.length) % enabledItems.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = enabledItems.length - 1;
+    else if (event.key === 'Escape') {
+      event.preventDefault();
+      closeContextMenu({ restoreFocus: true });
+      return;
+    } else return;
+    event.preventDefault();
+    enabledItems[nextIndex].focus({ preventScroll: true });
   });
 
   contextMenu.addEventListener('click', async (e) => {
     const actionEl = e.target.closest('.context-item');
-    if (!actionEl) return;
+    if (!actionEl || actionEl.disabled) return;
     
     const action = actionEl.dataset.action;
-    contextMenu.style.display = 'none';
+    closeContextMenu({ restoreFocus: true });
 
     if (action === 'rename-tab') {
       renameTab(selectedItemId);
@@ -1575,8 +1829,7 @@ function setupEventListeners() {
       const tabItems = config.items.filter(item => item.tabId === activeTabId);
       tabItems.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
       config.items = config.items.filter(item => item.tabId !== activeTabId).concat(tabItems);
-      await window.api.saveConfig(config);
-      renderItems();
+      if (await persistCurrentConfig()) renderItems();
     } else if (action === 'clean-tab-dup-bg') {
       const tabItems = config.items.filter(item => item.tabId === activeTabId);
       const seen = new Set();
@@ -1588,8 +1841,7 @@ function setupEventListeners() {
         }
       });
       config.items = config.items.filter(item => item.tabId !== activeTabId).concat(unique);
-      await window.api.saveConfig(config);
-      renderItems();
+      if (await persistCurrentConfig()) renderItems();
     } else if (action === 'batch-mode-bg') {
       isBatchMode = true;
       selectedItemsForBatch.clear();
@@ -1613,15 +1865,18 @@ function setupEventListeners() {
       switch(action) {
         case 'open':
           const openItem = config.items.find(i => i.id === selectedItemId);
-          if (openItem) window.api.launchItem(openItem.id);
+          if (openItem) await launchConfiguredItem(openItem.id);
           break;
         case 'admin':
           const adminItem = config.items.find(i => i.id === selectedItemId);
-          if (adminItem) window.api.launchItem(adminItem.id, true);
+          if (adminItem) await launchConfiguredItem(adminItem.id, true);
           break;
         case 'location':
           const locItem = config.items.find(i => i.id === selectedItemId);
-          if (locItem) window.api.showItemInFolder(locItem.id);
+          if (locItem) {
+            const result = await window.api.showItemInFolder(locItem.id);
+            if (!result || !result.success) await handleLaunchFailure(locItem.id, result || { code: 'GENERIC' });
+          }
           break;
         case 'batch-mode-item-menu':
           isBatchMode = true;
@@ -1653,8 +1908,7 @@ function setupEventListeners() {
           if (itemToDelete) {
             if (await showCustomConfirm(t.confirmDeleteItem.replace('{name}', itemToDelete.name))) {
               config.items = config.items.filter(i => i.id !== selectedItemId);
-              await window.api.saveConfig(config);
-              renderItems();
+              if (await persistCurrentConfig()) renderItems();
             }
           }
           break;
@@ -1693,8 +1947,8 @@ function setupEventListeners() {
         iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
         iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
       });
-      const iconDataUrl = await window.api.getFileIcon(iconRequest);
-      runtimeIconCache.set(itemId, iconDataUrl);
+      const iconResult = await window.api.getFileIcon(iconRequest);
+      runtimeIconCache.set(itemId, iconResult.url);
 
       config.items.push({
         id: itemId,
@@ -1707,11 +1961,14 @@ function setupEventListeners() {
         shortcutPath: iconRequest.shortcutPath || '',
         iconPath: iconRequest.iconPath || '',
         iconIndex: iconRequest.iconIndex || 0,
-        iconVersion: ICON_EXTRACTOR_VERSION
+        iconVersion: iconResult.fallback ? 0 : ICON_EXTRACTOR_VERSION
       });
     }
 
-    await window.api.saveConfig(config);
+    if (!await persistCurrentConfig()) {
+      renderItems();
+      return;
+    }
     renderItems();
   });
 
@@ -1785,7 +2042,10 @@ function setupEventListeners() {
   });
 
   window.api.onConfigUpdated((newConfig) => {
-    config = newConfig;
+    acceptCanonicalConfig(newConfig);
+    if (!config.tabs.some((tab) => tab.id === activeTabId)) {
+      activeTabId = config.tabs.length > 0 ? config.tabs[0].id : null;
+    }
     runtimeIconCache.clear();
     translateUI();
     applyAppearanceSettings();
@@ -1819,7 +2079,10 @@ function setupEventListeners() {
       }
       if (await showCustomConfirm(t.confirmBatchDelete.replace('{count}', selectedItemsForBatch.size))) {
         config.items = config.items.filter(item => !selectedItemsForBatch.has(item.id));
-        await window.api.saveConfig(config);
+        if (!await persistCurrentConfig()) {
+          renderItems();
+          return;
+        }
         isBatchMode = false;
         selectedItemsForBatch.clear();
         renderItems();
@@ -1849,7 +2112,10 @@ function setupEventListeners() {
         }
       });
       
-      await window.api.saveConfig(config);
+      if (!await persistCurrentConfig()) {
+        renderItems();
+        return;
+      }
       isBatchMode = false;
       selectedItemsForBatch.clear();
       renderItems();
@@ -1958,7 +2224,10 @@ function setupEventListeners() {
         }
       });
 
-      await window.api.saveConfig(config);
+      if (!await persistCurrentConfig()) {
+        renderItems();
+        return;
+      }
       closeBatchEdit();
 
       // Exit batch mode

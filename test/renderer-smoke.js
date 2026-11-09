@@ -71,17 +71,22 @@ const stubConfig = {
 };
 
 const ICON_STUB = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+const ICON_RESULT_STUB = { url: ICON_STUB, source: 'target-resource', fallback: false, errorCode: '' };
 
 const stubs = {
   'get-config': () => stubConfig,
-  'save-config': () => ({ success: true }),
+  'save-config': (event, config) => config.items.some((item) => item.name === '__FAIL_SAVE__')
+    ? { success: false, code: 'CONFIG_WRITE_FAILED', message: 'simulated write failure' }
+    : { success: true, config },
   'preview-appearance': () => {
     previewRequests++;
     return { success: true };
   },
-  'get-file-icon': () => ICON_STUB,
+  'get-file-icon': () => ICON_RESULT_STUB,
   'resolve-icon-request': (event, request) => request,
   'launch-item': () => ({ success: true }),
+  'find-item-repair': () => ({ success: false, code: 'NO_REPAIR_CANDIDATE', message: 'not found' }),
+  'apply-item-repair': () => ({ success: false, code: 'INVALID_REPAIR_TOKEN', message: 'invalid' }),
   'show-item-in-folder': () => ({ success: true }),
   'select-file': () => null,
   'select-folder': () => null,
@@ -176,6 +181,80 @@ app.whenReady().then(async () => {
         let settingsOuterFrameRemoved = true;
         let controlTextCentered = true;
         let footerButtonsReadable = true;
+        let contextMenusAccessible = true;
+        let contextMenusDebug = null;
+        let saveFailureRollsBack = true;
+        if (${JSON.stringify(page.label)} === 'index') {
+          const menu = document.getElementById('context-menu');
+          const card = document.querySelector('.grid-item');
+          const tab = document.querySelector('.tab-item');
+          const grid = document.querySelector('.grid-container');
+          const openMenu = async (target) => {
+            target.dispatchEvent(new MouseEvent('contextmenu', {
+              bubbles: true,
+              cancelable: true,
+              clientX: 120,
+              clientY: 120
+            }));
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            return Array.from(menu.querySelectorAll('button.context-item'));
+          };
+          const cardItems = await openMenu(card);
+          const menuStyle = getComputedStyle(menu);
+          const firstButtonStyle = getComputedStyle(cardItems[0]);
+          const menuWidth = menuStyle.width;
+          const menuRadius = menuStyle.borderRadius;
+          const menuBackgroundImage = menuStyle.backgroundImage;
+          const firstFontSize = firstButtonStyle.fontSize;
+          const firstMinHeight = firstButtonStyle.minHeight;
+          const firstFocused = document.activeElement === cardItems[0];
+          menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+          const downMovedFocus = document.activeElement === cardItems[1];
+          menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+          const endMovedFocus = document.activeElement === cardItems.at(-1);
+          menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          const focusRestored = document.activeElement === card && menu.getAttribute('aria-hidden') === 'true';
+
+          const tabItems = await openMenu(tab);
+          menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          const backgroundItems = await openMenu(grid);
+          menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+          const allMenuItems = [...cardItems, ...tabItems, ...backgroundItems];
+          contextMenusDebug = {
+            counts: [cardItems.length, tabItems.length, backgroundItems.length],
+            rolesAndIcons: allMenuItems.every((button) => button.tagName === 'BUTTON' && button.getAttribute('role') === 'menuitem' && !!button.querySelector('svg[aria-hidden="true"]')),
+            hasEmoji: /[\u{1F300}-\u{1FAFF}]/u.test(allMenuItems.map((button) => button.textContent).join('')),
+            menuWidth,
+            radius: menuRadius,
+            backgroundImage: menuBackgroundImage,
+            fontSize: firstFontSize,
+            minHeight: firstMinHeight,
+            firstFocused,
+            downMovedFocus,
+            endMovedFocus,
+            focusRestored
+          };
+          contextMenusAccessible = cardItems.length >= 5 && tabItems.length === 2 && backgroundItems.length === 6 &&
+            allMenuItems.every((button) => button.tagName === 'BUTTON' && button.getAttribute('role') === 'menuitem' &&
+              !!button.querySelector('svg[aria-hidden="true"]')) &&
+            !/[\u{1F300}-\u{1FAFF}]/u.test(allMenuItems.map((button) => button.textContent).join('')) &&
+            menuWidth === '224px' && menuRadius === '10px' && menuBackgroundImage === 'none' &&
+            firstFontSize === '14px' && firstMinHeight === '38px' &&
+            firstFocused && downMovedFocus && endMovedFocus && focusRestored;
+
+          await openMenu(card);
+          menu.querySelector('[data-action="edit"]').click();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          document.getElementById('item-name').value = '__FAIL_SAVE__';
+          document.getElementById('modal-save-btn').click();
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          document.getElementById('dialog-confirm-btn').click();
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          saveFailureRollsBack = !document.body.textContent.includes('__FAIL_SAVE__') &&
+            Array.from(document.querySelectorAll('.grid-item .item-name')).some((node) => node.textContent.includes('命令提示符'));
+        }
         if (${JSON.stringify(page.label)} === 'settings') {
           dedicatedSettingsStyles = Array.from(document.styleSheets).some((sheet) =>
             String(sheet.href || '').endsWith('/settings.css')
@@ -288,6 +367,9 @@ app.whenReady().then(async () => {
           settingsOuterFrameRemoved,
           controlTextCentered,
           footerButtonsReadable,
+          contextMenusAccessible,
+          contextMenusDebug,
+          saveFailureRollsBack,
           popupBlocked: window.open('https://example.com/') === null
         };
       })()`);
@@ -328,6 +410,8 @@ app.whenReady().then(async () => {
     r.checks.settingsColorsWork &&
     r.checks.floatingButtonsClearContent && r.checks.settingsOuterFrameRemoved &&
     r.checks.controlTextCentered && r.checks.footerButtonsReadable && r.checks.mainPreviewSent &&
+    r.checks.contextMenusAccessible &&
+    r.checks.saveFailureRollsBack &&
     r.checks.popupBlocked && r.checks.navigationBlocked &&
     r.cspViolations.length === 0 && r.errorMessages.length === 0
   );

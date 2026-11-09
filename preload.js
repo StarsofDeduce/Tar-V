@@ -71,6 +71,8 @@ contextBridge.exposeInMainWorld('api', {
   getFileIcon: (request, forceRefresh = false) => ipcRenderer.invoke('get-file-icon', request, forceRefresh),
   resolveIconRequest: (request) => ipcRenderer.invoke('resolve-icon-request', request),
   launchItem: (itemId, forceRunAsAdmin = false) => ipcRenderer.invoke('launch-item', itemId, forceRunAsAdmin),
+  findItemRepair: (itemId) => ipcRenderer.invoke('find-item-repair', itemId),
+  applyItemRepair: (itemId, token) => ipcRenderer.invoke('apply-item-repair', itemId, token),
   showItemInFolder: (itemId) => ipcRenderer.invoke('show-item-in-folder', itemId),
   selectFile: () => ipcRenderer.invoke('select-file'),
   selectFolder: () => ipcRenderer.invoke('select-folder'),

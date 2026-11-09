@@ -1,6 +1,7 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, dialog, shell, screen, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
 
@@ -16,6 +17,8 @@ const { validateConfig } = require('./lib/config-schema');
 const { selectConfiguredLaunch } = require('./lib/launch-policy');
 const { isTrustedIpcEvent, hardenRendererWindow } = require('./lib/security-boundary');
 const { createIconService, ICON_EXTRACTOR_VERSION } = require('./lib/icon-service');
+const { migratePersistedConfig, backupConfigFile, writeJsonAtomic } = require('./lib/config-store');
+const { chooseUniqueRepairCandidate } = require('./lib/item-repair');
 const {
   parseInternetShortcutBuffer,
   normalizeShellShortcut,
@@ -71,67 +74,90 @@ const FALLBACK_ICONS = {
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
 
+function createDefaultConfig() {
+  return {
+    settings: {
+      language: 'zh',
+      autostart: false,
+      hotkey: 'Alt+Q',
+      autoHideOnLaunch: true,
+      autoHideOnBlur: true,
+      pressEscToHide: true,
+      clickMode: 'single',
+      popupPos: 'center',
+      keepCentered: true,
+      columns: 8,
+      opacity: 85,
+      hideNames: false,
+      tabHover: false,
+      tabScroll: false,
+      tabKeys: false,
+      styleMode: 'original',
+      borderRadius: '8px',
+      bgColor: '#1e1e1e',
+      accentColor: '#e04f35',
+      settingsBgColor: '#1c1c1c',
+      settingsAccentColor: '#61269c',
+      settingsFollowTheme: true
+    },
+    tabs: [
+      { id: 'tab-1', name: '常用' },
+      { id: 'tab-2', name: '游戏' },
+      { id: 'tab-3', name: '工具' }
+    ],
+    items: [
+      { id: 'default-cmd', tabId: 'tab-1', name: '命令提示符', path: 'cmd.exe', args: '', icon: '', runAsAdmin: false },
+      { id: 'default-explorer', tabId: 'tab-1', name: '文件资源管理器', path: 'explorer.exe', args: '', icon: '', runAsAdmin: false }
+    ]
+  };
+}
+
 // Ensure config exists
 function loadConfig() {
   if (currentConfig) return currentConfig;
+  let failedConfigBackedUp = false;
   
   if (fs.existsSync(CONFIG_PATH)) {
     try {
       const data = fs.readFileSync(CONFIG_PATH, 'utf-8');
-      currentConfig = JSON.parse(data);
+      const parsed = JSON.parse(data);
+      const migration = migratePersistedConfig(parsed);
+      const validation = validateConfig(migration.value);
+      if (!validation.ok) {
+        throw new Error(`本地配置校验失败: ${validation.errors.slice(0, 8).join('；')}`);
+      }
+      currentConfig = validation.value;
+      if (migration.changed) {
+        const backupPath = backupConfigFile(CONFIG_PATH);
+        writeJsonAtomic(CONFIG_PATH, currentConfig);
+        console.info(`Migrated local config; backup saved to ${backupPath}`);
+      }
     } catch (e) {
-      console.error('Failed to load config, resetting to default', e);
+      console.error('Failed to load config:', e);
+      try {
+        const backupPath = backupConfigFile(CONFIG_PATH);
+        failedConfigBackedUp = Boolean(backupPath);
+        if (backupPath) console.info(`Invalid local config backed up to ${backupPath}`);
+      } catch (backupError) {
+        console.error('Failed to back up invalid config:', backupError);
+      }
     }
   }
   
   if (!currentConfig) {
-    currentConfig = {
-      settings: {
-        language: 'zh',
-        autostart: false,
-        hotkey: 'Alt+Q',
-        autoHideOnLaunch: true,
-        autoHideOnBlur: true,
-        pressEscToHide: true,
-        clickMode: 'single',
-        popupPos: 'center',
-        keepCentered: true,
-        columns: 8,
-        opacity: 85,
-        hideNames: false,
-        tabHover: false,
-        tabScroll: false,
-        tabKeys: false,
-        styleMode: 'original',
-        borderRadius: '8px',
-        bgColor: '#1e1e1e',
-        accentColor: '#e04f35',
-        settingsBgColor: '#1c1c1c',
-        settingsAccentColor: '#61269c',
-        settingsFollowTheme: true
-      },
-      tabs: [
-        { id: 'tab-1', name: '常用' },
-        { id: 'tab-2', name: '游戏' },
-        { id: 'tab-3', name: '工具' }
-      ],
-      items: [
-        { id: 'default-cmd', tabId: 'tab-1', name: '命令提示符', path: 'cmd.exe', args: '', icon: '', runAsAdmin: false },
-        { id: 'default-explorer', tabId: 'tab-1', name: '文件资源管理器', path: 'explorer.exe', args: '', icon: '', runAsAdmin: false }
-      ]
-    };
-    saveConfigSync(currentConfig);
+    currentConfig = createDefaultConfig();
+    if (!fs.existsSync(CONFIG_PATH) || failedConfigBackedUp) saveConfigSync(currentConfig);
   }
   return currentConfig;
 }
 
 let saveConfigDebounceTimeout = null;
 function saveConfigDebounced(config, delay = 500) {
-  currentConfig = config;
   if (saveConfigDebounceTimeout) clearTimeout(saveConfigDebounceTimeout);
   saveConfigDebounceTimeout = setTimeout(() => {
     try {
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
+      writeJsonAtomic(CONFIG_PATH, config);
+      currentConfig = config;
     } catch (e) {
       console.error('Failed to save config debounced', e);
     }
@@ -143,12 +169,9 @@ function saveConfigSync(config) {
     clearTimeout(saveConfigDebounceTimeout);
     saveConfigDebounceTimeout = null;
   }
+  writeJsonAtomic(CONFIG_PATH, config);
   currentConfig = config;
-  try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('Failed to save config sync', e);
-  }
+  return currentConfig;
 }
 
 // Center window on active monitor
@@ -468,18 +491,32 @@ handleTrustedIpc('save-config', ['main', 'settings'], (event, newConfig) => {
     candidate.settings.settingsWindowSize = current.settings.settingsWindowSize;
   }
 
-  const validation = validateConfig(candidate);
+  const migratedCandidate = migratePersistedConfig(candidate).value;
+  const validation = validateConfig(migratedCandidate);
   if (!validation.ok) {
-    return { success: false, error: validation.errors.slice(0, 8).join('；') };
+    return {
+      success: false,
+      code: 'CONFIG_VALIDATION_FAILED',
+      message: validation.errors.slice(0, 8).join('；')
+    };
   }
 
   const cleanConfig = validation.value;
-  saveConfigSync(cleanConfig);
+  try {
+    saveConfigSync(cleanConfig);
+  } catch (error) {
+    console.error('Failed to persist config:', error);
+    return {
+      success: false,
+      code: 'CONFIG_WRITE_FAILED',
+      message: '无法写入配置文件，请检查磁盘空间和文件权限'
+    };
+  }
   // Notify the main window to update its view instantly
   if (win && !win.isDestroyed()) {
     win.webContents.send('config-updated', cleanConfig);
   }
-  return { success: true, warnings: validation.warnings };
+  return { success: true, config: cleanConfig, warnings: validation.warnings };
 });
 
 // Preview appearance in the launcher without persisting it. Closing Settings restores
@@ -686,6 +723,82 @@ function findUrlFiles(root, maxDepth = 3, depth = 0, output = []) {
   return output;
 }
 
+function findShortcutFiles(root, maxDepth = 8, depth = 0, output = []) {
+  if (!root || depth > maxDepth || !fs.existsSync(root)) return output;
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (_) {
+    return output;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && isShortcutPath(fullPath)) output.push(fullPath);
+    if (entry.isDirectory()) findShortcutFiles(fullPath, maxDepth, depth + 1, output);
+  }
+  return output;
+}
+
+const repairCandidateTokens = new Map();
+let repairShortcutCache = { expiresAt: 0, candidates: [] };
+const REPAIR_TOKEN_TTL_MS = 5 * 60 * 1000;
+const REPAIR_INDEX_TTL_MS = 2 * 60 * 1000;
+
+function getRepairShortcutRoots() {
+  return [...new Set([
+    app.getPath('desktop'),
+    process.env.PUBLIC ? path.join(process.env.PUBLIC, 'Desktop') : '',
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs') : '',
+    process.env.ProgramData ? path.join(process.env.ProgramData, 'Microsoft', 'Windows', 'Start Menu', 'Programs') : ''
+  ].filter(Boolean).map((root) => path.resolve(root)))];
+}
+
+function getRepairShortcutCandidates({ forceRefresh = false } = {}) {
+  if (!forceRefresh && repairShortcutCache.expiresAt > Date.now()) {
+    return repairShortcutCache.candidates;
+  }
+
+  const seen = new Set();
+  const candidates = [];
+  for (const shortcutPath of getRepairShortcutRoots().flatMap((root) => findShortcutFiles(root))) {
+    const details = resolveShortcutFile(shortcutPath);
+    if (!details.target) continue;
+    if (!isProtocolTarget(details.target) && !fs.existsSync(details.target)) continue;
+    const key = `${shortcutPath.toLowerCase()}|${String(details.target).toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      name: path.basename(shortcutPath, path.extname(shortcutPath)),
+      target: details.target,
+      args: details.args || '',
+      cwd: details.cwd || '',
+      shortcutPath: details.shortcutPath || shortcutPath,
+      iconPath: details.iconPath || '',
+      iconIndex: Number.isInteger(details.iconIndex) ? details.iconIndex : 0
+    });
+  }
+
+  repairShortcutCache = { expiresAt: Date.now() + REPAIR_INDEX_TTL_MS, candidates };
+  return candidates;
+}
+
+function createRepairToken(itemId, candidate) {
+  const token = crypto.randomUUID();
+  repairCandidateTokens.set(token, {
+    itemId,
+    candidate,
+    expiresAt: Date.now() + REPAIR_TOKEN_TTL_MS
+  });
+  return token;
+}
+
+function pruneRepairTokens() {
+  const now = Date.now();
+  for (const [token, record] of repairCandidateTokens) {
+    if (record.expiresAt <= now) repairCandidateTokens.delete(token);
+  }
+}
+
 const steamShortcutCache = new Map();
 let steamShortcutIndex = null;
 
@@ -774,16 +887,65 @@ function isSystemCommandRef(cleanPath) {
   return !path.isAbsolute(cleanPath) && !fs.existsSync(cleanPath);
 }
 
+function launchFailure(code, message, details = {}) {
+  return { success: false, code, message, details };
+}
+
+function mapLaunchException(error, filePath) {
+  const rawMessage = String(error && error.message || '');
+  const code = String(error && error.code || '').toUpperCase();
+  if (code === 'EACCES' || code === 'EPERM') {
+    return launchFailure('ACCESS_DENIED', '系统拒绝访问该启动项', { path: filePath });
+  }
+  if (/\b1223\b|cancel(?:led|ed)|已取消|取消了操作/i.test(rawMessage)) {
+    return launchFailure('UAC_CANCELLED', '已取消管理员权限请求', { path: filePath });
+  }
+  return launchFailure('SYSTEM_LAUNCH_FAILED', '系统无法启动该项目', { path: filePath });
+}
+
+function spawnDetached(filePath, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(filePath, args, {
+      detached: true,
+      stdio: 'ignore',
+      shell: false,
+      windowsHide: true
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.removeListener('error', reject);
+      child.on('error', (error) => console.error('Detached process error:', error));
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+function refreshLaunchFromShortcut(item, selection) {
+  const shortcutPath = selection.shortcutPath || (item && item.shortcutPath) || '';
+  if (!shortcutPath || !fs.existsSync(shortcutPath)) return selection;
+  const details = resolveShortcutFile(shortcutPath);
+  if (!details.target) return selection;
+  return {
+    ...selection,
+    filePath: details.target,
+    args: typeof details.args === 'string' ? details.args : selection.args,
+    shortcutPath: details.shortcutPath || shortcutPath
+  };
+}
+
 // Launch item
 handleTrustedIpc('launch-item', ['main'], async (event, itemId, forceRunAsAdmin = false) => {
   const config = loadConfig();
   const selection = selectConfiguredLaunch(config, itemId, forceRunAsAdmin);
-  if (!selection.ok) return { success: false, error: selection.error };
+  if (!selection.ok) return launchFailure(selection.code || 'ITEM_NOT_FOUND', selection.error);
 
-  const { filePath, args, runAsAdmin } = selection.item;
+  const configuredItem = config.items.find((item) => item.id === itemId);
+  const launchItem = refreshLaunchFromShortcut(configuredItem, selection.item);
+  const { filePath, args, runAsAdmin } = launchItem;
   // 执行层再次确认最终路径，避免字段映射或调用契约回归时把空路径交给系统外壳。
   if (typeof filePath !== 'string' || filePath.trim().length === 0) {
-    return { success: false, error: '启动路径解析失败' };
+    return launchFailure('EMPTY_PATH', '启动路径为空');
   }
   
   try {
@@ -791,7 +953,7 @@ handleTrustedIpc('launch-item', ['main'], async (event, itemId, forceRunAsAdmin 
     if (isProtocolTarget(filePath)) {
       const protocol = protocolName(filePath);
       if (['file', 'javascript', 'data', 'vbscript'].includes(protocol)) {
-        throw new Error(`不允许启动协议: ${protocol}`);
+        return launchFailure('PROTOCOL_BLOCKED', '该协议不允许启动', { protocol });
       }
       await shell.openExternal(filePath);
       if (config.settings.autoHideOnLaunch) {
@@ -805,7 +967,7 @@ handleTrustedIpc('launch-item', ['main'], async (event, itemId, forceRunAsAdmin 
     const isCommandRef = isSystemCommandRef(cleanPath);
     
     if (!isCommandRef && !fs.existsSync(cleanPath)) {
-      throw new Error(`路径不存在: "${cleanPath}"`);
+      return launchFailure('PATH_NOT_FOUND', '启动文件可能已移动或卸载', { path: cleanPath });
     }
 
     // 参数按 Windows 命令行规则拆分为数组，后续全程不经过任何 shell
@@ -820,28 +982,12 @@ handleTrustedIpc('launch-item', ['main'], async (event, itemId, forceRunAsAdmin 
       // 提权只能通过 ShellExecute 的 RunAs 动词，参数以 CreateProcess 规则编码
       await startProcess(cleanPath, argList, { runAsAdmin: true });
     } else if (argList.length > 0) {
-      // 有参数：直接以进程方式启动，参数数组原样交给 CreateProcess
-      const child = spawn(cleanPath, argList, {
-        detached: true,
-        stdio: 'ignore',
-        shell: false,
-        windowsHide: true
-      });
-      child.on('error', (err) => console.error('Launch failed (spawn):', err));
-      child.unref();
+      await spawnDetached(cleanPath, argList);
     } else {
       // 无参数：优先交给系统外壳，保留文件关联行为
       const err = await shell.openPath(cleanPath);
       if (err) {
-        // 外壳无法处理时（例如系统目录下的命令）退回直接启动进程
-        const child = spawn(cleanPath, [], {
-          detached: true,
-          stdio: 'ignore',
-          shell: false,
-          windowsHide: true
-        });
-        child.on('error', (spawnErr) => console.error('Launch failed (fallback):', spawnErr));
-        child.unref();
+        await spawnDetached(cleanPath, []);
       }
     }
 
@@ -851,25 +997,123 @@ handleTrustedIpc('launch-item', ['main'], async (event, itemId, forceRunAsAdmin 
     return { success: true };
   } catch (error) {
     console.error('Launch failed:', error);
-    return { success: false, error: error.message };
+    return mapLaunchException(error, filePath);
   }
+});
+
+handleTrustedIpc('find-item-repair', ['main'], (event, itemId) => {
+  pruneRepairTokens();
+  const config = loadConfig();
+  const matches = config.items.filter((item) => item && item.id === itemId);
+  if (matches.length !== 1) return launchFailure('ITEM_NOT_FOUND', '无法找到需要修复的项目');
+  const item = matches[0];
+
+  let candidate = null;
+  if (item.shortcutPath && fs.existsSync(item.shortcutPath)) {
+    const details = resolveShortcutFile(item.shortcutPath);
+    if (details.target && (isProtocolTarget(details.target) || fs.existsSync(details.target))) {
+      candidate = {
+        name: path.basename(item.shortcutPath, path.extname(item.shortcutPath)),
+        target: details.target,
+        args: details.args || '',
+        cwd: details.cwd || '',
+        shortcutPath: details.shortcutPath || item.shortcutPath,
+        iconPath: details.iconPath || '',
+        iconIndex: Number.isInteger(details.iconIndex) ? details.iconIndex : 0,
+        score: 999
+      };
+    }
+  }
+
+  if (!candidate) {
+    candidate = chooseUniqueRepairCandidate(item, getRepairShortcutCandidates({ forceRefresh: true }));
+  }
+  if (!candidate) {
+    return launchFailure('NO_REPAIR_CANDIDATE', '没有找到唯一且可信的新位置', { oldPath: item.path });
+  }
+
+  const token = createRepairToken(item.id, candidate);
+  return {
+    success: true,
+    token,
+    candidate: {
+      name: candidate.name,
+      oldPath: item.path,
+      newPath: candidate.target,
+      shortcutPath: candidate.shortcutPath,
+      score: candidate.score
+    }
+  };
+});
+
+handleTrustedIpc('apply-item-repair', ['main'], (event, itemId, token) => {
+  pruneRepairTokens();
+  if (typeof token !== 'string' || token.length > 128) {
+    return launchFailure('INVALID_REPAIR_TOKEN', '修复请求无效或已经过期');
+  }
+  const record = repairCandidateTokens.get(token);
+  repairCandidateTokens.delete(token);
+  if (!record || record.itemId !== itemId || record.expiresAt <= Date.now()) {
+    return launchFailure('INVALID_REPAIR_TOKEN', '修复请求无效或已经过期');
+  }
+
+  const details = resolveShortcutFile(record.candidate.shortcutPath);
+  const expectedTarget = record.candidate.target || '';
+  const resolvedTarget = details.target || '';
+  const targetMatches = isProtocolTarget(expectedTarget) || isProtocolTarget(resolvedTarget)
+    ? resolvedTarget === expectedTarget
+    : path.resolve(resolvedTarget).toLowerCase() === path.resolve(expectedTarget).toLowerCase();
+  if (!details.target || !targetMatches) {
+    return launchFailure('REPAIR_TARGET_CHANGED', '快捷方式目标已经变化，请重新扫描');
+  }
+  if (!isProtocolTarget(details.target) && !fs.existsSync(details.target)) {
+    return launchFailure('PATH_NOT_FOUND', '候选启动文件已经不存在', { path: details.target });
+  }
+
+  const draft = JSON.parse(JSON.stringify(loadConfig()));
+  const matches = draft.items.filter((item) => item && item.id === itemId);
+  if (matches.length !== 1) return launchFailure('ITEM_NOT_FOUND', '无法找到需要修复的项目');
+  const item = matches[0];
+  item.path = details.target;
+  item.args = details.args || '';
+  item.shortcutPath = details.shortcutPath || record.candidate.shortcutPath;
+  item.iconPath = details.iconPath || '';
+  item.iconIndex = Number.isInteger(details.iconIndex) ? details.iconIndex : 0;
+  item.iconVersion = 0;
+  item.icon = '';
+
+  const validation = validateConfig(draft);
+  if (!validation.ok) {
+    return launchFailure('CONFIG_VALIDATION_FAILED', validation.errors.slice(0, 8).join('；'));
+  }
+  try {
+    saveConfigSync(validation.value);
+  } catch (error) {
+    console.error('Failed to save repaired item:', error);
+    return launchFailure('CONFIG_WRITE_FAILED', '修复结果无法写入配置文件');
+  }
+  iconService.clear();
+  if (win && !win.isDestroyed()) win.webContents.send('config-updated', validation.value);
+  return { success: true, config: validation.value, itemId };
 });
 
 // Open the containing folder for a configured item without accepting a renderer-supplied path.
 handleTrustedIpc('show-item-in-folder', ['main'], (event, itemId) => {
-  const selection = selectConfiguredLaunch(loadConfig(), itemId, false);
-  if (!selection.ok) return { success: false, error: selection.error };
-  const { filePath } = selection.item;
+  const config = loadConfig();
+  const selection = selectConfiguredLaunch(config, itemId, false);
+  if (!selection.ok) return launchFailure(selection.code || 'ITEM_NOT_FOUND', selection.error);
+  const configuredItem = config.items.find((item) => item.id === itemId);
+  const { filePath } = refreshLaunchFromShortcut(configuredItem, selection.item);
   if (typeof filePath !== 'string' || filePath.trim().length === 0) {
-    return { success: false, error: '启动路径解析失败' };
+    return launchFailure('EMPTY_PATH', '启动路径为空');
   }
   if (isProtocolTarget(filePath)) {
-    return { success: false, error: '协议启动项没有本地位置' };
+    return launchFailure('NO_LOCAL_LOCATION', '协议启动项没有本地位置');
   }
 
   const cleanPath = resolveAbsolutePath(filePath);
   if (!path.isAbsolute(cleanPath) || !fs.existsSync(cleanPath)) {
-    return { success: false, error: '无法找到启动项的本地位置' };
+    return launchFailure('PATH_NOT_FOUND', '无法找到启动项的本地位置', { path: cleanPath });
   }
 
   shell.showItemInFolder(cleanPath);
@@ -1048,9 +1292,13 @@ handleTrustedIpc('confirm-import-config', ['settings'], async (event, accept) =>
   }
 
   const importedConfig = pendingImport.config;
+  try {
+    saveConfigSync(importedConfig);
+  } catch (error) {
+    console.error('Failed to save imported config:', error);
+    return { success: false, error: '无法写入导入配置，请检查磁盘空间和文件权限' };
+  }
   pendingImport = null;
-
-  saveConfigSync(importedConfig);
 
   // 自启动与全局热键属于危险设置，只在确认后应用
   registerGlobalShortcut(importedConfig.settings.hotkey);

@@ -6,10 +6,23 @@
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { parseWindowsArgs, quoteForCreateProcess, quoteForCmdArg, buildCmdCommandLine } = require('../lib/args');
-const { psQuote, encodeCommand, buildProcessStartScript, buildIconExtractScript } = require('../lib/powershell');
+const {
+  ERROR_ENVELOPE_PREFIX,
+  psQuote,
+  encodeCommand,
+  buildProcessStartScript,
+  buildIconExtractScript,
+  wrapPowerShellScript,
+  decodePowerShellError
+} = require('../lib/powershell');
 const { isInside, hasTraversal, createDirAuthorizer } = require('../lib/path-guard');
 const { validateConfig } = require('../lib/config-schema');
+const { migratePersistedConfig, writeJsonAtomic } = require('../lib/config-store');
+const { chooseUniqueRepairCandidate, scoreRepairCandidate } = require('../lib/item-repair');
 const { selectConfiguredLaunch } = require('../lib/launch-policy');
 const { isTrustedIpcEvent, hardenRendererWindow } = require('../lib/security-boundary');
 const { WeightedLruCache } = require('../lib/icon-cache');
@@ -179,6 +192,19 @@ test('buildIconExtractScript 支持指定资源索引', () => {
   assert.ok(script.includes("'C:\\icons.dll', 3"));
 });
 
+test('PowerShell 包装关闭进度流并输出 UTF-8 Base64 错误信封', () => {
+  const wrapped = wrapPowerShellScript("throw '中文错误'");
+  assert.ok(wrapped.includes("$ProgressPreference = 'SilentlyContinue'"));
+  assert.ok(wrapped.includes('[Convert]::ToBase64String'));
+  const encoded = Buffer.from('中文错误', 'utf8').toString('base64');
+  assert.strictEqual(decodePowerShellError(`${ERROR_ENVELOPE_PREFIX}${encoded}`), '中文错误');
+});
+
+test('CLIXML 不直接进入用户提示', () => {
+  const decoded = decodePowerShellError('#< CLIXML\r\n<Objs><S S="Error">乱码</S></Objs>');
+  assert.strictEqual(decoded, 'PowerShell 操作失败');
+});
+
 // ---------------------------------------------------------------- path-guard
 console.log('\n[lib/path-guard]');
 
@@ -296,6 +322,37 @@ test('未知 settings 键被拒绝', () => {
   assert.ok(result.errors.some((e) => e.includes('mystery')));
 });
 
+test('本地旧实验字段仅在启动迁移中移除，其他配置保持不变', () => {
+  const cfg = baseConfig();
+  cfg.settings.liquidGlassEnabled = true;
+  cfg.settings.mainRoundedCorners = true;
+  cfg.settings.frostedGlassEnabled = false;
+  const migration = migratePersistedConfig(cfg);
+  assert.strictEqual(migration.changed, true);
+  assert.deepStrictEqual(migration.removedSettings.sort(), [
+    'frostedGlassEnabled', 'liquidGlassEnabled', 'mainRoundedCorners'
+  ]);
+  assert.strictEqual(validateConfig(migration.value).ok, true);
+  assert.strictEqual(migration.value.items.length, cfg.items.length);
+});
+
+test('外部导入仍拒绝旧实验字段和未知字段', () => {
+  const cfg = baseConfig();
+  cfg.settings.liquidGlassEnabled = true;
+  assert.strictEqual(validateConfig(cfg).ok, false);
+});
+
+test('原子写入失败时不覆盖原配置', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tar-v-config-store-'));
+  const filePath = path.join(root, 'config.json');
+  fs.writeFileSync(filePath, '{"stable":true}', 'utf8');
+  const failingFs = Object.create(fs);
+  failingFs.renameSync = () => { throw new Error('simulated write failure'); };
+  assert.throws(() => writeJsonAtomic(filePath, { stable: false }, { fsImpl: failingFs }), /simulated/);
+  assert.strictEqual(fs.readFileSync(filePath, 'utf8'), '{"stable":true}');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('自启动与管理员项进入摘要', () => {
   const cfg = baseConfig();
   cfg.settings.autostart = true;
@@ -396,6 +453,29 @@ test('加权 LRU 同时执行条目和字节上限', () => {
   assert.ok(cache.bytes <= 8);
 });
 
+test('Antigravity 旧路径能匹配唯一高可信开始菜单候选', () => {
+  const item = {
+    name: 'Antigravity IDE',
+    path: 'C:\\Users\\me\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe'
+  };
+  const candidate = {
+    name: 'Antigravity IDE',
+    target: 'C:\\AppData\\Antigravity IDE\\Antigravity IDE.exe',
+    shortcutPath: 'C:\\Users\\me\\Start Menu\\Antigravity IDE.lnk'
+  };
+  assert.ok(scoreRepairCandidate(item, candidate) >= 120);
+  assert.strictEqual(chooseUniqueRepairCandidate(item, [candidate]).target, candidate.target);
+});
+
+test('多个同分高可信候选时不自动提出修复', () => {
+  const item = { name: 'Example', path: 'C:\\Old\\Example.exe' };
+  const candidates = [
+    { name: 'Example', target: 'C:\\A\\Example.exe', shortcutPath: 'C:\\Start\\A.lnk' },
+    { name: 'Example', target: 'C:\\B\\Example.exe', shortcutPath: 'C:\\Start\\B.lnk' }
+  ];
+  assert.strictEqual(chooseUniqueRepairCandidate(item, candidates), null);
+});
+
 // ---------------------------------------------------------------- launch-policy
 console.log('\n[lib/launch-policy]');
 
@@ -404,7 +484,7 @@ test('启动时只从当前配置按 ID 取真实路径与参数', () => {
   const result = selectConfiguredLaunch(cfg, 'i1');
   assert.strictEqual(result.ok, true);
   assert.deepStrictEqual(result.item, {
-    id: 'i1', filePath: 'cmd.exe', args: '', runAsAdmin: false
+    id: 'i1', filePath: 'cmd.exe', args: '', runAsAdmin: false, shortcutPath: ''
   });
   assert.notStrictEqual(result.item.filePath, 'explorer.exe');
   assert.ok(result.item.filePath.length > 0);

@@ -2,7 +2,12 @@
 let config = null;
 let originalConfigStr = '';
 let deadItemsList = [];
-const ICON_EXTRACTOR_VERSION = 2;
+let persistedConfig = null;
+const ICON_EXTRACTOR_VERSION = 3;
+
+function cloneConfig(value) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 function iconRequestFromItem(item) {
   return {
@@ -13,12 +18,12 @@ function iconRequestFromItem(item) {
   };
 }
 
-function applyIconMetadata(item, request) {
+function applyIconMetadata(item, request, iconResult = null) {
   item.icon = '';
   item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
-  item.iconVersion = ICON_EXTRACTOR_VERSION;
+  item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
 }
 
 // Dictionary for multi-language translation (Req 34)
@@ -163,6 +168,7 @@ const TRANSLATIONS = {
     msg_scan_clean: "检测完毕，未发现失效快捷项！",
     msg_clean_done: "失效项目清理完成！",
     msg_repair_success: "快捷启动图标已成功重载并刷新缓存！",
+    msg_repair_partial: "图标修复完成：成功 {repaired} 个，占位或失败 {failed} 个。",
     msg_repair_fail: "图标重载失败: ",
     msg_sort_success: "已对所有分组下的项目进行字母升序排列！",
     msg_dup_success: "重复项清理完成！共移除了 {count} 个重复的快捷方式。",
@@ -319,6 +325,7 @@ const TRANSLATIONS = {
     msg_scan_clean: "Scan complete. No dead shortcut paths found!",
     msg_clean_done: "Dead paths cleanup completed!",
     msg_repair_success: "Shortcut icons rebuilt and refreshed successfully!",
+    msg_repair_partial: "Icon repair finished: {repaired} repaired, {failed} placeholders or failures.",
     msg_repair_fail: "Icon repair failed: ",
     msg_sort_success: "Successfully sorted shortcuts under all tabs alphabetically!",
     msg_dup_success: "Duplicates clean up complete! Removed {count} duplicate items.",
@@ -724,6 +731,24 @@ function showCustomConfirm(message) {
   });
 }
 
+async function persistSettingsConfig({ rollbackTo = null, showError = true } = {}) {
+  const saved = await window.api.saveConfig(config);
+  if (saved && saved.success) {
+    config = saved.config || config;
+    persistedConfig = cloneConfig(config);
+    originalConfigStr = JSON.stringify(config);
+    return true;
+  }
+
+  if (rollbackTo) config = cloneConfig(rollbackTo);
+  if (showError) {
+    const lang = config.settings.language || 'zh';
+    const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    await showCustomAlert(t.msg_save_fail + (saved && (saved.message || saved.error) || ''));
+  }
+  return false;
+}
+
 // Initialize the settings page
 async function init() {
   config = await window.api.getConfig();
@@ -732,6 +757,7 @@ async function init() {
   mergeDefaultSettings();
   
   originalConfigStr = JSON.stringify(config);
+  persistedConfig = cloneConfig(config);
   
   initFormValues();
   translateUI(); // Apply English/Chinese UI translations dynamically (Req 34)
@@ -1249,6 +1275,7 @@ function setupEventListeners() {
           checkbox.disabled = true;
           try {
             const request = await window.api.resolveIconRequest({ path });
+            const iconResult = await window.api.getFileIcon(request);
             const item = {
               id: 'win-app-' + path.replace('.', '-') + '-' + Date.now(),
               tabId: commonTabId,
@@ -1258,7 +1285,7 @@ function setupEventListeners() {
               runAsAdmin: false,
               icon: ''
             };
-            applyIconMetadata(item, request);
+            applyIconMetadata(item, request, iconResult);
             config.items.push(item);
           } catch (err) {
             console.error('Failed to get icon for ' + path, err);
@@ -1292,13 +1319,7 @@ function setupEventListeners() {
 
   // Footer Save
   btnSettingsSave.addEventListener('click', async () => {
-    const saved = await window.api.saveConfig(config);
-    if (!saved || !saved.success) {
-      const lang = config.settings.language || 'zh';
-      const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
-      await showCustomAlert(t.msg_save_fail + (saved && saved.error ? saved.error : ''));
-      return;
-    }
+    if (!await persistSettingsConfig()) return;
     // Apply changes on systems side
     await window.api.updateAutostart(config.settings.autostart);
     await window.api.registerShortcut(config.settings.hotkey);
@@ -1327,6 +1348,7 @@ function setupEventListeners() {
     
     btnRepairIcons.disabled = true;
     btnRepairIcons.textContent = t.msg_reloading;
+    const before = cloneConfig(config);
     try {
       let repaired = 0;
       let failed = 0;
@@ -1334,16 +1356,19 @@ function setupEventListeners() {
         const item = config.items[i];
         try {
           const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
-          await window.api.getFileIcon(request, true);
-          applyIconMetadata(item, request);
-          repaired++;
+          const iconResult = await window.api.getFileIcon(request, true);
+          applyIconMetadata(item, request, iconResult);
+          if (iconResult && iconResult.fallback === false) repaired++;
+          else failed++;
         } catch (err) {
           failed++;
           console.error('Failed to repair icon:', item.name, err);
         }
       }
-      await window.api.saveConfig(config);
-      const result = failed > 0 ? `${t.msg_repair_success} (${repaired} / ${config.items.length}, ${failed} failed)` : t.msg_repair_success;
+      if (!await persistSettingsConfig({ rollbackTo: before })) return;
+      const result = failed > 0
+        ? t.msg_repair_partial.replace('{repaired}', repaired).replace('{failed}', failed)
+        : t.msg_repair_success;
       await showCustomAlert(result);
     } catch (err) {
       await showCustomAlert(t.msg_repair_fail + err.message);
@@ -1357,8 +1382,9 @@ function setupEventListeners() {
   btnSortAllItems.addEventListener('click', async () => {
     const lang = config.settings.language || 'zh';
     const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    const before = cloneConfig(config);
     config.items.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
-    await window.api.saveConfig(config);
+    if (!await persistSettingsConfig({ rollbackTo: before })) return;
     await showCustomAlert(t.msg_sort_success);
   });
 
@@ -1366,6 +1392,7 @@ function setupEventListeners() {
   btnCleanDuplicates.addEventListener('click', async () => {
     const lang = config.settings.language || 'zh';
     const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    const before = cloneConfig(config);
     const seen = new Set();
     const unique = [];
     config.items.forEach(item => {
@@ -1378,7 +1405,7 @@ function setupEventListeners() {
     
     const count = config.items.length - unique.length;
     config.items = unique;
-    await window.api.saveConfig(config);
+    if (!await persistSettingsConfig({ rollbackTo: before })) return;
     await showCustomAlert(t.msg_dup_success.replace('{count}', count));
   });
 
@@ -1446,10 +1473,11 @@ function setupEventListeners() {
     
     if (deadItemsList.length === 0) return;
 
+    const before = cloneConfig(config);
     const deadIds = new Set(deadItemsList.map(item => item.id));
     config.items = config.items.filter(item => !deadIds.has(item.id));
 
-    await window.api.saveConfig(config);
+    if (!await persistSettingsConfig({ rollbackTo: before })) return;
     pathCheckResults.innerHTML = `<div style="color: #10b981; padding: 4px;">${t.msg_clean_done}</div>`;
     btnCleanPaths.style.display = 'none';
     deadItemsList = [];
@@ -1459,6 +1487,7 @@ function setupEventListeners() {
   btnCleanEmptyTabs.addEventListener('click', async () => {
     const lang = config.settings.language || 'zh';
     const t = TRANSLATIONS[lang] || TRANSLATIONS.zh;
+    const before = cloneConfig(config);
     
     const usedTabIds = new Set(config.items.map(item => item.tabId));
     const originalCount = config.tabs.length;
@@ -1466,7 +1495,7 @@ function setupEventListeners() {
     config.tabs = config.tabs.filter(tab => usedTabIds.has(tab.id));
     const removedCount = originalCount - config.tabs.length;
 
-    await window.api.saveConfig(config);
+    if (!await persistSettingsConfig({ rollbackTo: before })) return;
     await showCustomAlert(t.msg_empty_success.replace('{count}', removedCount));
   });
 

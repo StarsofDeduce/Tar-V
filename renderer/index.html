@@ -75,24 +75,7 @@
     </main>
 
     <!-- Custom Right-Click Context Menu -->
-    <div id="context-menu" class="context-menu" style="display: none;">
-      <div class="context-item" data-action="open">
-        <span class="icon">🚀</span> 打开
-      </div>
-      <div class="context-item" data-action="admin">
-        <span class="icon">🛡️</span> 以管理员身份运行
-      </div>
-      <div class="context-item" data-action="location">
-        <span class="icon">📂</span> 打开文件位置
-      </div>
-      <div class="divider"></div>
-      <div class="context-item" data-action="edit">
-        <span class="icon">✏️</span> 编辑属性
-      </div>
-      <div class="context-item text-danger" data-action="delete">
-        <span class="icon">❌</span> 删除快捷方式
-      </div>
-    </div>
+    <div id="context-menu" class="context-menu" role="menu" aria-hidden="true" style="display: none;"></div>
 
     <!-- Item Edit Dialog Modal -->
     <div id="edit-modal" class="modal-overlay" style="display: none;">
@@ -138,7 +121,7 @@
           <button class="modal-close" id="dialog-close-x">&times;</button>
         </div>
         <div class="modal-body" style="padding: 16px 20px; font-size: 13px; color: var(--text-primary); line-height: 1.5;">
-          <p id="dialog-message" style="word-break: break-all; overflow-wrap: break-word; white-space: pre-wrap; margin: 0; text-align: left; max-height: 250px; overflow-y: auto;">提示内容</p>
+          <p id="dialog-message" style="word-break: normal; overflow-wrap: anywhere; white-space: pre-wrap; margin: 0; text-align: left; max-height: 250px; overflow-y: auto;">提示内容</p>
         </div>
         <div class="modal-footer">
           <button id="dialog-cancel-btn" class="btn-secondary">取消</button>
