@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { createIconService } = require('../lib/icon-service');
-const { buildIconExtractScript, runEncodedPowerShell } = require('../lib/powershell');
+const { buildIconExtractScript, buildFolderTypeIconScript, runEncodedPowerShell } = require('../lib/powershell');
 
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tar-v-icon-service-'));
@@ -14,13 +14,25 @@ async function main() {
   const shortcut = path.join(root, 'app.lnk');
   const movedExecutable = path.join(root, 'moved.exe');
   const folder = path.join(root, 'folder');
+  const portableApp = path.join(root, 'PortableBox');
+  const ambiguousFolder = path.join(root, 'Ambiguous');
+  const unrelatedExecutableFolder = path.join(root, 'Documents');
   fs.writeFileSync(executable, 'exe');
   fs.writeFileSync(iconFile, 'ico');
   fs.writeFileSync(shortcut, 'lnk');
   fs.mkdirSync(folder);
+  fs.mkdirSync(portableApp);
+  fs.mkdirSync(ambiguousFolder);
+  fs.mkdirSync(unrelatedExecutableFolder);
+  fs.writeFileSync(path.join(portableApp, 'PortableBox.exe'), 'exe');
+  fs.writeFileSync(path.join(portableApp, 'update.exe'), 'exe');
+  fs.writeFileSync(path.join(ambiguousFolder, 'Alpha.exe'), 'exe');
+  fs.writeFileSync(path.join(ambiguousFolder, 'Beta.exe'), 'exe');
+  fs.writeFileSync(path.join(unrelatedExecutableFolder, 'viewer.exe'), 'exe');
 
   let extractCalls = 0;
   let shellCalls = 0;
+  let folderTypeCalls = 0;
   const fallbackIcons = {
     file: 'data:image/svg+xml;base64,file',
     folder: 'data:image/svg+xml;base64,folder',
@@ -41,6 +53,10 @@ async function main() {
       extractCalls++;
       await new Promise((resolve) => setTimeout(resolve, 15));
       return Buffer.from(`${filePath}:${index}`).toString('base64');
+    },
+    extractFolderTypeIcon: async () => {
+      folderTypeCalls++;
+      return Buffer.from('windows-folder').toString('base64');
     },
     cacheDir: path.join(root, 'cache'),
     fallbackIcons
@@ -71,10 +87,22 @@ async function main() {
   assert.strictEqual(shellCalls, 0, '目标程序资源图标成功时不应读取通用快捷方式图标');
 
   const folderIcon = await service.getIcon({ path: folder });
-  assert.strictEqual(folderIcon.url, fallbackIcons.folder);
-  assert.strictEqual(folderIcon.source, 'type-folder');
+  assert.strictEqual(folderIcon.url, `data:image/png;base64,${Buffer.from('windows-folder').toString('base64')}`);
+  assert.strictEqual(folderIcon.source, 'type-folder-shell');
   assert.strictEqual(folderIcon.fallback, false);
-  assert.strictEqual(shellCalls, 0, '目录应使用确定的文件夹类型图标，而不是空白 Shell 文件图标');
+  assert.strictEqual(shellCalls, 0, '目录应使用 Windows 目录类型图标，而不是按真实路径取得的空白图标');
+  assert.strictEqual(folderTypeCalls, 1);
+
+  const portableIcon = await service.getIcon({ name: 'PortableBox', path: portableApp });
+  assert.strictEqual(portableIcon.source, 'directory-app-resource');
+  assert.ok(portableIcon.url.startsWith('data:image/png;base64,'));
+
+  const ambiguousIcon = await service.getIcon({ name: 'Unrelated', path: ambiguousFolder });
+  assert.strictEqual(ambiguousIcon.source, 'type-folder-shell', '多个不匹配的 EXE 不得把普通目录误判为应用');
+
+  const unrelatedExecutableIcon = await service.getIcon({ name: 'Documents', path: unrelatedExecutableFolder });
+  assert.strictEqual(unrelatedExecutableIcon.source, 'type-folder-shell', '仅有一个无关 EXE 也不得自动判定为应用');
+  assert.strictEqual(folderTypeCalls, 1, 'Windows 目录类型图标在同一服务中只提取一次');
 
   const missing = await service.getIcon({ path: movedExecutable });
   assert.strictEqual(missing.fallback, true);
@@ -94,11 +122,16 @@ async function main() {
     const png = Buffer.from(extracted.stdout, 'base64');
     assert.strictEqual(extracted.code, 0, extracted.stderr || extracted.rawStderr);
     assert.deepStrictEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+
+    const folderExtracted = await runEncodedPowerShell(buildFolderTypeIconScript(), { timeoutMs: 30000 });
+    const folderPng = Buffer.from(folderExtracted.stdout, 'base64');
+    assert.strictEqual(folderExtracted.code, 0, folderExtracted.stderr || folderExtracted.rawStderr);
+    assert.deepStrictEqual([...folderPng.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
   }
 
   service.dispose();
   fs.rmSync(root, { recursive: true, force: true });
-  console.log('通过 19 项，失败 0 项');
+  console.log('通过 27 项，失败 0 项');
 }
 
 main().catch((err) => {

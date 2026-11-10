@@ -9,7 +9,8 @@ const { parseWindowsArgs } = require('./lib/args');
 const {
   runEncodedPowerShell,
   startProcess,
-  buildIconExtractScript
+  buildIconExtractScript,
+  buildFolderTypeIconScript
 } = require('./lib/powershell');
 const { launchBatchFile } = require('./lib/launch');
 const { createDirAuthorizer, hasTraversal } = require('./lib/path-guard');
@@ -662,6 +663,16 @@ function extractIconWithPowerShell(targetPath, iconIndex = 0) {
   });
 }
 
+function extractFolderTypeIconWithPowerShell() {
+  return queuePowerShell(async () => {
+    const result = await runEncodedPowerShell(buildFolderTypeIconScript(), { timeoutMs: 15000 });
+    if (result.code !== 0) {
+      throw new Error(result.stderr || `PowerShell 退出码 ${result.code}`);
+    }
+    return result.stdout;
+  });
+}
+
 function shortcutFallback(filePath = '') {
   return {
     target: filePath,
@@ -884,6 +895,7 @@ const iconService = createIconService({
   app,
   nativeImage,
   extractExecutableIcon: extractIconWithPowerShell,
+  extractFolderTypeIcon: extractFolderTypeIconWithPowerShell,
   cacheDir: path.join(app.getPath('userData'), `icon-cache-v${ICON_EXTRACTOR_VERSION}`),
   fallbackIcons: FALLBACK_ICONS
 });

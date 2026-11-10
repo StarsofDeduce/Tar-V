@@ -3,7 +3,7 @@ let config = null;
 let originalConfigStr = '';
 let deadItemsList = [];
 let persistedConfig = null;
-const ICON_EXTRACTOR_VERSION = 4;
+const ICON_EXTRACTOR_VERSION = 5;
 
 function cloneConfig(value) {
   return JSON.parse(JSON.stringify(value));

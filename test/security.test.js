@@ -16,6 +16,7 @@ const {
   encodeCommand,
   buildProcessStartScript,
   buildIconExtractScript,
+  buildFolderTypeIconScript,
   wrapPowerShellScript,
   decodePowerShellError
 } = require('../lib/powershell');
@@ -190,6 +191,15 @@ test('buildIconExtractScript 支持指定资源索引', () => {
   const script = buildIconExtractScript('C:\\icons.dll', 3);
   assert.ok(script.includes('ExtractIconEx'));
   assert.ok(script.includes("'C:\\icons.dll', 3"));
+});
+
+test('文件夹类型图标由 Shell 类型接口生成且不依赖本机路径或资源编号', () => {
+  const script = buildFolderTypeIconScript();
+  assert.ok(script.includes('SHGetFileInfo'));
+  assert.ok(script.includes('SHGFI_USEFILEATTRIBUTES'));
+  assert.ok(script.includes('FILE_ATTRIBUTE_DIRECTORY'));
+  assert.ok(!/[A-Z]:\\/i.test(script));
+  assert.ok(!script.includes('imageres.dll'));
 });
 
 test('PowerShell 包装关闭进度流并输出 UTF-8 Base64 错误信封', () => {
