@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createIconService } = require('../lib/icon-service');
+const { createIconService, MAX_ICON_DATA_URL_LENGTH } = require('../lib/icon-service');
 const { buildIconExtractScript, buildFolderTypeIconScript, runEncodedPowerShell } = require('../lib/powershell');
 const { findSquirrelIconSource } = require('../lib/squirrel-icon');
 
@@ -19,6 +19,8 @@ async function main() {
   const ambiguousFolder = path.join(root, 'Ambiguous');
   const unrelatedExecutableFolder = path.join(root, 'Documents');
   const squirrelRoot = path.join(root, 'SquirrelProduct');
+  const squirrelVersionRoot = path.join(root, 'SquirrelVersionProduct');
+  const oversizedIcon = path.join(root, 'oversized.ico');
   fs.writeFileSync(executable, 'exe');
   fs.writeFileSync(iconFile, 'ico');
   fs.writeFileSync(shortcut, 'lnk');
@@ -27,6 +29,8 @@ async function main() {
   fs.mkdirSync(ambiguousFolder);
   fs.mkdirSync(unrelatedExecutableFolder);
   fs.mkdirSync(squirrelRoot);
+  fs.mkdirSync(squirrelVersionRoot);
+  fs.mkdirSync(path.join(squirrelVersionRoot, 'app-2.0.0'));
   fs.writeFileSync(path.join(portableApp, 'PortableBox.exe'), 'exe');
   fs.writeFileSync(path.join(portableApp, 'update.exe'), 'exe');
   fs.writeFileSync(path.join(ambiguousFolder, 'Alpha.exe'), 'exe');
@@ -34,6 +38,9 @@ async function main() {
   fs.writeFileSync(path.join(unrelatedExecutableFolder, 'viewer.exe'), 'exe');
   fs.writeFileSync(path.join(squirrelRoot, 'Update.exe'), 'exe');
   fs.writeFileSync(path.join(squirrelRoot, 'app.ico'), 'ico');
+  fs.writeFileSync(path.join(squirrelVersionRoot, 'Update.exe'), 'exe');
+  fs.writeFileSync(path.join(squirrelVersionRoot, 'app-2.0.0', 'Product.exe'), 'exe');
+  fs.writeFileSync(oversizedIcon, 'ico');
 
   let extractCalls = 0;
   let shellCalls = 0;
@@ -52,7 +59,12 @@ async function main() {
       }
     },
     nativeImage: {
-      createFromPath: () => ({ isEmpty: () => false, toDataURL: () => 'data:image/png;base64,direct' })
+      createFromPath: (filePath) => ({
+        isEmpty: () => false,
+        toDataURL: () => filePath === oversizedIcon
+          ? 'data:image/png;base64,' + 'A'.repeat(MAX_ICON_DATA_URL_LENGTH)
+          : 'data:image/png;base64,direct'
+      })
     },
     extractExecutableIcon: async (filePath, index) => {
       extractCalls++;
@@ -108,12 +120,26 @@ async function main() {
   assert.strictEqual(unrelatedExecutableIcon.source, 'type-folder-shell', '仅有一个无关 EXE 也不得自动判定为应用');
   assert.strictEqual(folderTypeCalls, 1, 'Windows 目录类型图标在同一服务中只提取一次');
 
+  const oversized = await service.getIcon({ path: executable, iconPath: oversizedIcon });
+  assert.strictEqual(oversized.source, 'target-resource', '超大显式图像应被拒绝并安全回退到启动目标图标');
+  assert.ok(oversized.url.length <= MAX_ICON_DATA_URL_LENGTH, '超大图像数据不得进入内存和磁盘图标缓存');
+
+  const oversizedRequest = await service.getIcon({ path: 'A'.repeat(2049) });
+  assert.strictEqual(oversizedRequest.errorCode, 'NO_ICON_SOURCE');
+
   const squirrelIcon = findSquirrelIconSource(
     path.join(squirrelRoot, 'Update.exe'),
     '--processStart Product.exe'
   );
   assert.strictEqual(squirrelIcon.iconPath, path.join(squirrelRoot, 'app.ico'));
   assert.strictEqual(squirrelIcon.source, 'squirrel-root-icon');
+  const squirrelVersionIcon = findSquirrelIconSource(
+    path.join(squirrelVersionRoot, 'Update.exe'),
+    '--processStart Product.exe'
+  );
+  assert.strictEqual(squirrelVersionIcon.iconPath, path.join(squirrelVersionRoot, 'app-2.0.0', 'Product.exe'));
+  assert.strictEqual(squirrelVersionIcon.source, 'squirrel-process-resource');
+  assert.strictEqual(findSquirrelIconSource('Update.exe', '--processStart Product.exe'), null);
 
   const missing = await service.getIcon({ path: movedExecutable });
   assert.strictEqual(missing.fallback, true);
@@ -142,7 +168,7 @@ async function main() {
 
   service.dispose();
   fs.rmSync(root, { recursive: true, force: true });
-  console.log('通过 29 项，失败 0 项');
+  console.log('通过 34 项，失败 0 项');
 }
 
 main().catch((err) => {

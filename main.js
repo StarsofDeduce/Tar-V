@@ -300,7 +300,8 @@ function createWindow() {
 
 function registerGlobalShortcut(accelerator) {
   globalShortcut.unregisterAll();
-  if (!accelerator) return;
+  if (!accelerator) return true;
+  if (typeof accelerator !== 'string' || accelerator.length > 64 || /[\0\r\n]/.test(accelerator)) return false;
   
   try {
     const ret = globalShortcut.register(accelerator, () => {
@@ -309,9 +310,66 @@ function registerGlobalShortcut(accelerator) {
     if (!ret) {
       console.error(`Registration failed for shortcut: ${accelerator}`);
     }
+    return ret;
   } catch (e) {
     console.error(`Invalid shortcut string: ${accelerator}`, e);
+    return false;
   }
+}
+
+function prepareRuntimeSettings(nextSettings, previousSettings) {
+  const next = nextSettings || {};
+  const previous = previousSettings || {};
+  const nextHotkey = typeof next.hotkey === 'string' ? next.hotkey : '';
+  const previousHotkey = typeof previous.hotkey === 'string' ? previous.hotkey : '';
+  const hotkeyChanged = nextHotkey !== previousHotkey;
+  const autostartChanged = Boolean(next.autostart) !== Boolean(previous.autostart);
+
+  const rollback = () => {
+    if (hotkeyChanged) registerGlobalShortcut(previousHotkey);
+    if (autostartChanged) {
+      try {
+        app.setLoginItemSettings({
+          openAtLogin: Boolean(previous.autostart),
+          path: app.getPath('exe'),
+          args: ['--hidden']
+        });
+      } catch (error) {
+        console.error('Failed to roll back autostart setting:', error);
+      }
+    }
+  };
+
+  if (hotkeyChanged && !registerGlobalShortcut(nextHotkey)) {
+    registerGlobalShortcut(previousHotkey);
+    return {
+      success: false,
+      code: 'HOTKEY_REGISTRATION_FAILED',
+      message: '快捷键被占用或格式无效',
+      rollback: () => {}
+    };
+  }
+
+  if (autostartChanged) {
+    try {
+      app.setLoginItemSettings({
+        openAtLogin: Boolean(next.autostart),
+        path: app.getPath('exe'),
+        args: ['--hidden']
+      });
+    } catch (error) {
+      console.error('Failed to apply autostart setting:', error);
+      rollback();
+      return {
+        success: false,
+        code: 'AUTOSTART_UPDATE_FAILED',
+        message: '无法更新开机启动设置',
+        rollback: () => {}
+      };
+    }
+  }
+
+  return { success: true, rollback };
 }
 
 function getTrayIcon() {
@@ -504,9 +562,12 @@ handleTrustedIpc('save-config', ['main', 'settings'], (event, newConfig) => {
   }
 
   const cleanConfig = validation.value;
+  const runtimeSettings = prepareRuntimeSettings(cleanConfig.settings, current.settings);
+  if (!runtimeSettings.success) return runtimeSettings;
   try {
     saveConfigSync(cleanConfig);
   } catch (error) {
+    runtimeSettings.rollback();
     console.error('Failed to persist config:', error);
     return {
       success: false,
@@ -515,7 +576,7 @@ handleTrustedIpc('save-config', ['main', 'settings'], (event, newConfig) => {
     };
   }
   // Notify the main window to update its view instantly
-  if (win && !win.isDestroyed()) {
+  if (win && !win.isDestroyed() && event.sender !== win.webContents) {
     win.webContents.send('config-updated', cleanConfig);
   }
   return { success: true, config: cleanConfig, warnings: validation.warnings };
@@ -859,8 +920,28 @@ function findSteamShortcut(target) {
   return result;
 }
 
+function boundedIconString(value, maxLength) {
+  return typeof value === 'string' && value.length <= maxLength ? value : '';
+}
+
+function sanitizeIconRequest(input) {
+  const source = typeof input === 'string' ? { path: input } : (
+    input && typeof input === 'object' && !Array.isArray(input) ? input : {}
+  );
+  return {
+    name: boundedIconString(source.name, 128),
+    path: boundedIconString(source.path, 2048),
+    args: boundedIconString(source.args, 1024),
+    shortcutPath: boundedIconString(source.shortcutPath, 2048),
+    iconPath: boundedIconString(source.iconPath, 2048),
+    iconIndex: Number.isInteger(source.iconIndex) && source.iconIndex >= -32768 && source.iconIndex <= 32767
+      ? source.iconIndex
+      : 0
+  };
+}
+
 function enrichIconRequest(input) {
-  const request = typeof input === 'string' ? { path: input } : { ...(input || {}) };
+  const request = sanitizeIconRequest(input);
   const sourcePath = request.shortcutPath || (isShortcutPath(request.path) ? request.path : '');
   let details = sourcePath ? resolveShortcutFile(sourcePath) : null;
   if (!details && steamAppId(request.path)) details = findSteamShortcut(request.path);
@@ -883,6 +964,7 @@ function enrichIconRequest(input) {
 
   if (details) {
     request.path = details.target || request.path;
+    request.args = details.args || request.args || '';
     request.shortcutPath = details.shortcutPath || sourcePath;
     request.iconPath = details.iconPath || request.iconPath || '';
     request.iconIndex = Number.isInteger(details.iconIndex) ? details.iconIndex : (request.iconIndex || 0);
@@ -928,6 +1010,65 @@ handleTrustedIpc('get-file-icon', ['main', 'settings'], async (event, input, for
 
 handleTrustedIpc('resolve-icon-request', ['main', 'settings'], (event, input) => {
   return enrichIconRequest(input);
+});
+
+// Merge background icon metadata without letting a stale renderer overwrite
+// tabs, settings, paths or other item changes made at the same time.
+handleTrustedIpc('commit-icon-metadata', ['main'], (event, updates) => {
+  if (!Array.isArray(updates) || updates.length > 5000) {
+    return { success: false, code: 'INVALID_ICON_UPDATES', message: '图标更新数据无效' };
+  }
+
+  const draft = JSON.parse(JSON.stringify(loadConfig()));
+  const byId = new Map(draft.items.map((item) => [item.id, item]));
+  let applied = 0;
+  let skipped = 0;
+
+  for (const update of updates) {
+    if (!update || typeof update !== 'object' || Array.isArray(update)) {
+      skipped++;
+      continue;
+    }
+    const item = byId.get(boundedIconString(update.id, 128));
+    const expectedName = boundedIconString(update.name, 128);
+    const expectedPath = boundedIconString(update.path, 2048);
+    const expectedArgs = boundedIconString(update.args, 1024);
+    if (!item || item.name !== expectedName || item.path !== expectedPath || item.args !== expectedArgs) {
+      skipped++;
+      continue;
+    }
+    const shortcutPath = boundedIconString(update.shortcutPath, 2048);
+    const iconPath = boundedIconString(update.iconPath, 2048);
+    const iconIndex = Number.isInteger(update.iconIndex) && update.iconIndex >= -32768 && update.iconIndex <= 32767
+      ? update.iconIndex
+      : 0;
+    const iconVersion = Number.isInteger(update.iconVersion) && update.iconVersion >= 0 && update.iconVersion <= 1000
+      ? update.iconVersion
+      : 0;
+    item.shortcutPath = shortcutPath;
+    item.iconPath = iconPath;
+    item.iconIndex = iconIndex;
+    item.iconVersion = iconVersion;
+    item.icon = '';
+    applied++;
+  }
+
+  if (applied === 0) return { success: true, applied, skipped };
+  const validation = validateConfig(draft);
+  if (!validation.ok) {
+    return {
+      success: false,
+      code: 'CONFIG_VALIDATION_FAILED',
+      message: validation.errors.slice(0, 8).join('；')
+    };
+  }
+  try {
+    saveConfigSync(validation.value);
+  } catch (error) {
+    console.error('Failed to commit icon metadata:', error);
+    return { success: false, code: 'CONFIG_WRITE_FAILED', message: '无法保存图标更新' };
+  }
+  return { success: true, applied, skipped };
 });
 
 // 判断是否为"系统命令引用"（例如 cmd.exe 这类相对名），交给系统按 PATH 解析
@@ -1198,28 +1339,6 @@ handleTrustedIpc('select-folder', ['main'], async (event) => {
   return result.filePaths[0];
 });
 
-// Auto-start setting
-handleTrustedIpc('update-autostart', ['settings'], (event, enabled) => {
-  app.setLoginItemSettings({
-    openAtLogin: enabled,
-    path: app.getPath('exe'),
-    args: ['--hidden']
-  });
-  const config = loadConfig();
-  config.settings.autostart = enabled;
-  saveConfigSync(config);
-  return { success: true };
-});
-
-// Change Global Hotkey
-handleTrustedIpc('register-shortcut', ['settings'], (event, accelerator) => {
-  registerGlobalShortcut(accelerator);
-  const config = loadConfig();
-  config.settings.hotkey = accelerator;
-  saveConfigSync(config);
-  return { success: true };
-});
-
 // Check file paths existence
 handleTrustedIpc('check-paths', ['settings'], (event, paths) => {
   if (!Array.isArray(paths)) return [];
@@ -1340,21 +1459,19 @@ handleTrustedIpc('confirm-import-config', ['settings'], async (event, accept) =>
   }
 
   const importedConfig = pendingImport.config;
+  const previousConfig = loadConfig();
+  const runtimeSettings = prepareRuntimeSettings(importedConfig.settings, previousConfig.settings);
+  if (!runtimeSettings.success) {
+    return { success: false, code: runtimeSettings.code, error: runtimeSettings.message };
+  }
   try {
     saveConfigSync(importedConfig);
   } catch (error) {
+    runtimeSettings.rollback();
     console.error('Failed to save imported config:', error);
     return { success: false, error: '无法写入导入配置，请检查磁盘空间和文件权限' };
   }
   pendingImport = null;
-
-  // 自启动与全局热键属于危险设置，只在确认后应用
-  registerGlobalShortcut(importedConfig.settings.hotkey);
-  app.setLoginItemSettings({
-    openAtLogin: importedConfig.settings.autostart === true,
-    path: app.getPath('exe'),
-    args: ['--hidden']
-  });
 
   if (win && !win.isDestroyed()) {
     win.reload();

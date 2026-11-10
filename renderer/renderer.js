@@ -37,6 +37,27 @@ function iconRequestFromItem(item) {
   };
 }
 
+function iconItemIdentity(item) {
+  return JSON.stringify([
+    item.id || '', item.name || '', item.path || '', item.args || '',
+    item.shortcutPath || '', item.iconPath || '',
+    Number.isInteger(item.iconIndex) ? item.iconIndex : 0
+  ]);
+}
+
+function iconMetadataUpdate(item) {
+  return {
+    id: item.id || '',
+    name: item.name || '',
+    path: item.path || '',
+    args: item.args || '',
+    shortcutPath: item.shortcutPath || '',
+    iconPath: item.iconPath || '',
+    iconIndex: Number.isInteger(item.iconIndex) ? item.iconIndex : 0,
+    iconVersion: Number.isInteger(item.iconVersion) ? item.iconVersion : 0
+  };
+}
+
 function applyIconMetadata(item, request, iconResult = null) {
   if (!request.inferredShortcutPath) item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
@@ -53,7 +74,9 @@ function shouldForceIconMigration(item, request) {
 }
 
 async function loadItemIcon(item, { forceRefresh = false, migrate = false } = {}) {
-  if (runtimeIconLoads.has(item.id)) return runtimeIconLoads.get(item.id);
+  const identity = iconItemIdentity(item);
+  const existing = runtimeIconLoads.get(item.id);
+  if (existing && existing.identity === identity) return existing.promise;
   const promise = (async () => {
     const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
     const refresh = forceRefresh || (migrate && shouldForceIconMigration(item, request));
@@ -63,11 +86,17 @@ async function loadItemIcon(item, { forceRefresh = false, migrate = false } = {}
     if (request.targetKind === 'file' && /folder/i.test(iconResult.source || '')) {
       iconResult = await window.api.getFileIcon(request, true);
     }
-    runtimeIconCache.set(item.id, iconResult.url);
-    applyIconMetadata(item, request, iconResult);
+    const currentItem = config.items.find((candidate) => candidate.id === item.id);
+    if (currentItem && iconItemIdentity(currentItem) === identity) {
+      runtimeIconCache.set(item.id, iconResult.url);
+      applyIconMetadata(currentItem, request, iconResult);
+    }
     return iconResult.url;
-  })().finally(() => runtimeIconLoads.delete(item.id));
-  runtimeIconLoads.set(item.id, promise);
+  })().finally(() => {
+    const active = runtimeIconLoads.get(item.id);
+    if (active && active.promise === promise) runtimeIconLoads.delete(item.id);
+  });
+  runtimeIconLoads.set(item.id, { identity, promise });
   return promise;
 }
 
@@ -78,20 +107,27 @@ async function migrateLegacyIconsInBackground() {
     const pending = config.items.filter((item) => item.iconVersion !== ICON_EXTRACTOR_VERSION);
     if (pending.length === 0) return;
     let cursor = 0;
-    let changed = 0;
     const worker = async () => {
       while (cursor < pending.length) {
         const item = pending[cursor++];
         try {
           await loadItemIcon(item, { migrate: true });
-          changed++;
         } catch (err) {
           console.error('Background icon migration failed:', item.name, err);
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(6, pending.length) }, () => worker()));
-    if (changed > 0) await persistCurrentConfig({ showError: false });
+    const pendingIds = new Set(pending.map((item) => item.id));
+    const updates = config.items
+      .filter((item) => pendingIds.has(item.id) && item.iconVersion === ICON_EXTRACTOR_VERSION)
+      .map(iconMetadataUpdate);
+    if (updates.length > 0) {
+      const committed = await window.api.commitIconMetadata(updates);
+      if (!committed || !committed.success) {
+        console.error('Failed to commit migrated icon metadata:', committed && committed.message);
+      }
+    }
   })().finally(() => {
     iconMigrationPromise = null;
   });

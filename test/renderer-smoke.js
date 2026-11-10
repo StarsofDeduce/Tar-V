@@ -32,6 +32,7 @@ let previewRequests = 0;
 let iconRequests = 0;
 let forcedIconRequests = 0;
 let saveRequests = 0;
+let metadataCommitRequests = 0;
 
 const stubConfig = {
   settings: {
@@ -94,6 +95,10 @@ const stubs = {
     return ICON_RESULT_STUB;
   },
   'resolve-icon-request': (event, request) => request,
+  'commit-icon-metadata': (event, updates) => {
+    metadataCommitRequests++;
+    return { success: true, applied: updates.length, skipped: 0 };
+  },
   'launch-item': () => ({ success: true }),
   'find-item-repair': () => ({ success: false, code: 'NO_REPAIR_CANDIDATE', message: 'not found' }),
   'apply-item-repair': () => ({ success: false, code: 'INVALID_REPAIR_TOKEN', message: 'invalid' }),
@@ -176,13 +181,14 @@ app.whenReady().then(async () => {
     iconRequests = 0;
     forcedIconRequests = 0;
     saveRequests = 0;
+    metadataCommitRequests = 0;
     try {
       const pagePath = path.join(root, page.file);
       activeTrustedUrl = pathToFileURL(pagePath).href;
       hardenRendererWindow(win, activeTrustedUrl);
       await win.loadFile(pagePath);
       await new Promise((r) => setTimeout(r, 1200));
-      const initialIconMetrics = { iconRequests, forcedIconRequests, saveRequests };
+      const initialIconMetrics = { iconRequests, forcedIconRequests, saveRequests, metadataCommitRequests };
 
       const checks = await win.webContents.executeJavaScript(`(async () => {
         await document.fonts.ready;
@@ -392,7 +398,8 @@ app.whenReady().then(async () => {
       checks.iconMigrationDeduplicated = page.label !== 'index' || (
         initialIconMetrics.iconRequests === stubConfig.items.length &&
         initialIconMetrics.forcedIconRequests === stubConfig.items.length &&
-        initialIconMetrics.saveRequests === 1
+        initialIconMetrics.saveRequests === 0 &&
+        initialIconMetrics.metadataCommitRequests === 1
       );
       checks.initialIconMetrics = initialIconMetrics;
 

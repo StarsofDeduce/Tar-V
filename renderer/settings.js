@@ -1322,10 +1322,7 @@ function setupEventListeners() {
   // Footer Save
   btnSettingsSave.addEventListener('click', async () => {
     if (!await persistSettingsConfig()) return;
-    // Apply changes on systems side
-    await window.api.updateAutostart(config.settings.autostart);
-    await window.api.registerShortcut(config.settings.hotkey);
-    
+
     // Close the settings window
     window.close();
   });
