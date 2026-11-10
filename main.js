@@ -20,6 +20,7 @@ const { isTrustedIpcEvent, hardenRendererWindow } = require('./lib/security-boun
 const { createIconService, ICON_EXTRACTOR_VERSION } = require('./lib/icon-service');
 const { migratePersistedConfig, backupConfigFile, writeJsonAtomic } = require('./lib/config-store');
 const { chooseUniqueRepairCandidate } = require('./lib/item-repair');
+const { findSquirrelIconSource } = require('./lib/squirrel-icon');
 const {
   parseInternetShortcutBuffer,
   normalizeShellShortcut,
@@ -868,7 +869,8 @@ function enrichIconRequest(input) {
   // by matching only Start Menu/Desktop shortcuts, but mark it as inferred so
   // the renderer never turns an icon lookup into a silent launch-path repair.
   const canInferByName = typeof request.name === 'string' && request.name.length > 0 && request.name.length <= 256;
-  if (!details && canInferByName && request.path && !isProtocolTarget(request.path)) {
+  const missingAbsoluteTarget = typeof request.path === 'string' && path.isAbsolute(request.path) && !fs.existsSync(request.path);
+  if (!details && canInferByName && missingAbsoluteTarget && !isProtocolTarget(request.path)) {
     const candidate = chooseUniqueRepairCandidate(
       { name: request.name, path: request.path },
       getRepairShortcutCandidates()
@@ -885,8 +887,27 @@ function enrichIconRequest(input) {
     request.iconPath = details.iconPath || request.iconPath || '';
     request.iconIndex = Number.isInteger(details.iconIndex) ? details.iconIndex : (request.iconIndex || 0);
   }
+
+  if (!request.iconPath) {
+    const squirrelIcon = findSquirrelIconSource(request.path, request.args);
+    if (squirrelIcon) {
+      request.iconPath = squirrelIcon.iconPath;
+      request.iconIndex = squirrelIcon.iconIndex;
+      request.iconSource = squirrelIcon.source;
+    }
+  }
   if (request.path && !isProtocolTarget(request.path) && !isShortcutPath(request.path)) {
     request.path = resolveAbsolutePath(request.path);
+  }
+  if (isProtocolTarget(request.path)) {
+    request.targetKind = 'protocol';
+  } else {
+    try {
+      const targetStat = fs.statSync(request.path);
+      request.targetKind = targetStat.isDirectory() ? 'folder' : 'file';
+    } catch (_) {
+      request.targetKind = request.path && path.isAbsolute(request.path) ? 'missing' : 'command';
+    }
   }
   return request;
 }

@@ -6,7 +6,8 @@ let isBatchMode = false;
 let selectedItemsForBatch = new Set();
 let draggedItemId = null;
 let draggedTabId = null;
-const ICON_EXTRACTOR_VERSION = 5;
+const ICON_EXTRACTOR_VERSION = 6;
+const ICON_CACHE_COMPATIBLE_VERSION = 5;
 const runtimeIconCache = new Map();
 const runtimeIconLoads = new Map();
 let persistedConfig = null;
@@ -29,6 +30,7 @@ function iconRequestFromItem(item) {
   return {
     name: item.name || '',
     path: item.path || '',
+    args: item.args || '',
     shortcutPath: item.shortcutPath || '',
     iconPath: item.iconPath || '',
     iconIndex: Number.isInteger(item.iconIndex) ? item.iconIndex : 0
@@ -39,15 +41,28 @@ function applyIconMetadata(item, request, iconResult = null) {
   if (!request.inferredShortcutPath) item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
-  item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
+  item.iconVersion = iconResult && iconResult.url ? ICON_EXTRACTOR_VERSION : 0;
   item.icon = '';
 }
 
-async function loadItemIcon(item, { forceRefresh = false } = {}) {
+function shouldForceIconMigration(item, request) {
+  // Folder requests now use one new shared cache key, so even V5's incorrect
+  // per-directory records cannot be read and no forced extraction is needed.
+  if (request.targetKind === 'folder') return false;
+  return !Number.isInteger(item.iconVersion) || item.iconVersion < ICON_CACHE_COMPATIBLE_VERSION;
+}
+
+async function loadItemIcon(item, { forceRefresh = false, migrate = false } = {}) {
   if (runtimeIconLoads.has(item.id)) return runtimeIconLoads.get(item.id);
   const promise = (async () => {
     const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
-    const iconResult = await window.api.getFileIcon(request, forceRefresh);
+    const refresh = forceRefresh || (migrate && shouldForceIconMigration(item, request));
+    let iconResult = await window.api.getFileIcon(request, refresh);
+    // A file can never legitimately use the folder-type result. Repair a stale
+    // or mismatched cache entry without refreshing every healthy application.
+    if (request.targetKind === 'file' && /folder/i.test(iconResult.source || '')) {
+      iconResult = await window.api.getFileIcon(request, true);
+    }
     runtimeIconCache.set(item.id, iconResult.url);
     applyIconMetadata(item, request, iconResult);
     return iconResult.url;
@@ -56,19 +71,31 @@ async function loadItemIcon(item, { forceRefresh = false } = {}) {
   return promise;
 }
 
+let iconMigrationPromise = null;
 async function migrateLegacyIconsInBackground() {
-  let changed = 0;
-  for (const item of config.items) {
-    if (item.iconVersion === ICON_EXTRACTOR_VERSION) continue;
-    try {
-      await loadItemIcon(item, { forceRefresh: true });
-      changed++;
-      if (changed % 10 === 0) await persistCurrentConfig({ showError: false });
-    } catch (err) {
-      console.error('Background icon migration failed:', item.name, err);
-    }
-  }
-  if (changed > 0) await persistCurrentConfig({ showError: false });
+  if (iconMigrationPromise) return iconMigrationPromise;
+  iconMigrationPromise = (async () => {
+    const pending = config.items.filter((item) => item.iconVersion !== ICON_EXTRACTOR_VERSION);
+    if (pending.length === 0) return;
+    let cursor = 0;
+    let changed = 0;
+    const worker = async () => {
+      while (cursor < pending.length) {
+        const item = pending[cursor++];
+        try {
+          await loadItemIcon(item, { migrate: true });
+          changed++;
+        } catch (err) {
+          console.error('Background icon migration failed:', item.name, err);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, pending.length) }, () => worker()));
+    if (changed > 0) await persistCurrentConfig({ showError: false });
+  })().finally(() => {
+    iconMigrationPromise = null;
+  });
+  return iconMigrationPromise;
 }
 
 // Dictionary for multi-language translation (Req 34)
@@ -444,15 +471,6 @@ const modalSaveBtn = document.getElementById('modal-save-btn');
 const modalCancelBtn = document.getElementById('modal-cancel-btn');
 const modalCloseX = editModal.querySelector('.modal-close');
 
-// Debounced save config helper
-let saveConfigTimeout = null;
-function debouncedSaveConfig() {
-  if (saveConfigTimeout) clearTimeout(saveConfigTimeout);
-  saveConfigTimeout = setTimeout(() => {
-    persistCurrentConfig({ showError: false });
-  }, 1000);
-}
-
 // Custom Alert Modal
 function showCustomAlert(message, { title = null } = {}) {
   return new Promise((resolve) => {
@@ -591,6 +609,7 @@ async function manuallyRelocateItem(itemId) {
   const iconRequest = await window.api.resolveIconRequest({
     name: draftItem.name,
     path: targetPath,
+    args: targetArgs,
     shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
     iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
     iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
@@ -732,7 +751,9 @@ async function init() {
   renderTabs();
   renderItems();
   setupEventListeners();
-  setTimeout(() => migrateLegacyIconsInBackground(), 750);
+  // Snapshot stale items immediately. Visible-card loads and the background
+  // workers share the same per-item promise, then the migration saves once.
+  void migrateLegacyIconsInBackground();
 
   // Listen to prefers-color-scheme theme changes dynamically (Req 35)
   const themeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
@@ -1127,9 +1148,8 @@ async function renderItems(query = '') {
 
     if (!runtimeIcon) {
       const requiresMigration = item.iconVersion !== ICON_EXTRACTOR_VERSION;
-      loadItemIcon(item, { forceRefresh: requiresMigration }).then((url) => {
+      loadItemIcon(item, { migrate: requiresMigration }).then((url) => {
         if (iconImg.isConnected) iconImg.src = url;
-        if (requiresMigration) debouncedSaveConfig();
       }).catch((err) => {
         console.error('File icon extraction error', err);
       });
@@ -1464,6 +1484,7 @@ async function batchImportFolder() {
     const iconRequest = await window.api.resolveIconRequest({
       name,
       path: finalPath,
+      args: finalArgs,
       shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
       iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
       iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
@@ -1482,7 +1503,7 @@ async function batchImportFolder() {
       shortcutPath: iconRequest.shortcutPath || '',
       iconPath: iconRequest.iconPath || '',
       iconIndex: iconRequest.iconIndex || 0,
-      iconVersion: iconResult.fallback ? 0 : ICON_EXTRACTOR_VERSION
+      iconVersion: iconResult && iconResult.url ? ICON_EXTRACTOR_VERSION : 0
     });
     count++;
   }
@@ -1545,6 +1566,7 @@ async function saveItemDetails() {
   const iconRequest = await window.api.resolveIconRequest({
     name,
     path: targetPath,
+    args: targetArgs,
     shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
     iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
     iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
@@ -1948,6 +1970,7 @@ function setupEventListeners() {
       const iconRequest = await window.api.resolveIconRequest({
         name: dispName,
         path: targetPath,
+        args: targetArgs,
         shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
         iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
         iconIndex: shortcutDetails ? shortcutDetails.iconIndex : 0
@@ -1966,7 +1989,7 @@ function setupEventListeners() {
         shortcutPath: iconRequest.shortcutPath || '',
         iconPath: iconRequest.iconPath || '',
         iconIndex: iconRequest.iconIndex || 0,
-        iconVersion: iconResult.fallback ? 0 : ICON_EXTRACTOR_VERSION
+        iconVersion: iconResult && iconResult.url ? ICON_EXTRACTOR_VERSION : 0
       });
     }
 

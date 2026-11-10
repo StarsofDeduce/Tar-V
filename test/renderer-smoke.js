@@ -29,6 +29,9 @@ const pageErrors = [];
 let testWindow = null;
 let activeTrustedUrl = '';
 let previewRequests = 0;
+let iconRequests = 0;
+let forcedIconRequests = 0;
+let saveRequests = 0;
 
 const stubConfig = {
   settings: {
@@ -75,14 +78,21 @@ const ICON_RESULT_STUB = { url: ICON_STUB, source: 'target-resource', fallback: 
 
 const stubs = {
   'get-config': () => stubConfig,
-  'save-config': (event, config) => config.items.some((item) => item.name === '__FAIL_SAVE__')
-    ? { success: false, code: 'CONFIG_WRITE_FAILED', message: 'simulated write failure' }
-    : { success: true, config },
+  'save-config': (event, config) => {
+    saveRequests++;
+    return config.items.some((item) => item.name === '__FAIL_SAVE__')
+      ? { success: false, code: 'CONFIG_WRITE_FAILED', message: 'simulated write failure' }
+      : { success: true, config };
+  },
   'preview-appearance': () => {
     previewRequests++;
     return { success: true };
   },
-  'get-file-icon': () => ICON_RESULT_STUB,
+  'get-file-icon': (event, request, forceRefresh) => {
+    iconRequests++;
+    if (forceRefresh === true) forcedIconRequests++;
+    return ICON_RESULT_STUB;
+  },
   'resolve-icon-request': (event, request) => request,
   'launch-item': () => ({ success: true }),
   'find-item-repair': () => ({ success: false, code: 'NO_REPAIR_CANDIDATE', message: 'not found' }),
@@ -163,12 +173,16 @@ app.whenReady().then(async () => {
 
   for (const page of pages) {
     messages = [];
+    iconRequests = 0;
+    forcedIconRequests = 0;
+    saveRequests = 0;
     try {
       const pagePath = path.join(root, page.file);
       activeTrustedUrl = pathToFileURL(pagePath).href;
       hardenRendererWindow(win, activeTrustedUrl);
       await win.loadFile(pagePath);
       await new Promise((r) => setTimeout(r, 1200));
+      const initialIconMetrics = { iconRequests, forcedIconRequests, saveRequests };
 
       const checks = await win.webContents.executeJavaScript(`(async () => {
         await document.fonts.ready;
@@ -375,6 +389,12 @@ app.whenReady().then(async () => {
       })()`);
 
       checks.mainPreviewSent = page.label !== 'settings' || previewRequests > 0;
+      checks.iconMigrationDeduplicated = page.label !== 'index' || (
+        initialIconMetrics.iconRequests === stubConfig.items.length &&
+        initialIconMetrics.forcedIconRequests === stubConfig.items.length &&
+        initialIconMetrics.saveRequests === 1
+      );
+      checks.initialIconMetrics = initialIconMetrics;
 
       await win.webContents.executeJavaScript("window.location.href = 'https://example.com/'; true");
       await new Promise((r) => setTimeout(r, 100));
@@ -411,6 +431,7 @@ app.whenReady().then(async () => {
     r.checks.floatingButtonsClearContent && r.checks.settingsOuterFrameRemoved &&
     r.checks.controlTextCentered && r.checks.footerButtonsReadable && r.checks.mainPreviewSent &&
     r.checks.contextMenusAccessible &&
+    r.checks.iconMigrationDeduplicated &&
     r.checks.saveFailureRollsBack &&
     r.checks.popupBlocked && r.checks.navigationBlocked &&
     r.cspViolations.length === 0 && r.errorMessages.length === 0

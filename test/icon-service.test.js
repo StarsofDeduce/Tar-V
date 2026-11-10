@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { createIconService } = require('../lib/icon-service');
 const { buildIconExtractScript, buildFolderTypeIconScript, runEncodedPowerShell } = require('../lib/powershell');
+const { findSquirrelIconSource } = require('../lib/squirrel-icon');
 
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tar-v-icon-service-'));
@@ -17,6 +18,7 @@ async function main() {
   const portableApp = path.join(root, 'PortableBox');
   const ambiguousFolder = path.join(root, 'Ambiguous');
   const unrelatedExecutableFolder = path.join(root, 'Documents');
+  const squirrelRoot = path.join(root, 'SquirrelProduct');
   fs.writeFileSync(executable, 'exe');
   fs.writeFileSync(iconFile, 'ico');
   fs.writeFileSync(shortcut, 'lnk');
@@ -24,11 +26,14 @@ async function main() {
   fs.mkdirSync(portableApp);
   fs.mkdirSync(ambiguousFolder);
   fs.mkdirSync(unrelatedExecutableFolder);
+  fs.mkdirSync(squirrelRoot);
   fs.writeFileSync(path.join(portableApp, 'PortableBox.exe'), 'exe');
   fs.writeFileSync(path.join(portableApp, 'update.exe'), 'exe');
   fs.writeFileSync(path.join(ambiguousFolder, 'Alpha.exe'), 'exe');
   fs.writeFileSync(path.join(ambiguousFolder, 'Beta.exe'), 'exe');
   fs.writeFileSync(path.join(unrelatedExecutableFolder, 'viewer.exe'), 'exe');
+  fs.writeFileSync(path.join(squirrelRoot, 'Update.exe'), 'exe');
+  fs.writeFileSync(path.join(squirrelRoot, 'app.ico'), 'ico');
 
   let extractCalls = 0;
   let shellCalls = 0;
@@ -94,8 +99,7 @@ async function main() {
   assert.strictEqual(folderTypeCalls, 1);
 
   const portableIcon = await service.getIcon({ name: 'PortableBox', path: portableApp });
-  assert.strictEqual(portableIcon.source, 'directory-app-resource');
-  assert.ok(portableIcon.url.startsWith('data:image/png;base64,'));
+  assert.strictEqual(portableIcon.source, 'type-folder-shell', '目录内容即使有同名 EXE 也必须保持文件夹语义');
 
   const ambiguousIcon = await service.getIcon({ name: 'Unrelated', path: ambiguousFolder });
   assert.strictEqual(ambiguousIcon.source, 'type-folder-shell', '多个不匹配的 EXE 不得把普通目录误判为应用');
@@ -103,6 +107,13 @@ async function main() {
   const unrelatedExecutableIcon = await service.getIcon({ name: 'Documents', path: unrelatedExecutableFolder });
   assert.strictEqual(unrelatedExecutableIcon.source, 'type-folder-shell', '仅有一个无关 EXE 也不得自动判定为应用');
   assert.strictEqual(folderTypeCalls, 1, 'Windows 目录类型图标在同一服务中只提取一次');
+
+  const squirrelIcon = findSquirrelIconSource(
+    path.join(squirrelRoot, 'Update.exe'),
+    '--processStart Product.exe'
+  );
+  assert.strictEqual(squirrelIcon.iconPath, path.join(squirrelRoot, 'app.ico'));
+  assert.strictEqual(squirrelIcon.source, 'squirrel-root-icon');
 
   const missing = await service.getIcon({ path: movedExecutable });
   assert.strictEqual(missing.fallback, true);
@@ -131,7 +142,7 @@ async function main() {
 
   service.dispose();
   fs.rmSync(root, { recursive: true, force: true });
-  console.log('通过 27 项，失败 0 项');
+  console.log('通过 29 项，失败 0 项');
 }
 
 main().catch((err) => {

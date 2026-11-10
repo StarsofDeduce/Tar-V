@@ -3,7 +3,7 @@ let config = null;
 let originalConfigStr = '';
 let deadItemsList = [];
 let persistedConfig = null;
-const ICON_EXTRACTOR_VERSION = 5;
+const ICON_EXTRACTOR_VERSION = 6;
 
 function cloneConfig(value) {
   return JSON.parse(JSON.stringify(value));
@@ -13,6 +13,7 @@ function iconRequestFromItem(item) {
   return {
     name: item.name || '',
     path: item.path || '',
+    args: item.args || '',
     shortcutPath: item.shortcutPath || '',
     iconPath: item.iconPath || '',
     iconIndex: Number.isInteger(item.iconIndex) ? item.iconIndex : 0
@@ -24,7 +25,7 @@ function applyIconMetadata(item, request, iconResult = null) {
   if (!request.inferredShortcutPath) item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
-  item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
+  item.iconVersion = iconResult && iconResult.url ? ICON_EXTRACTOR_VERSION : 0;
 }
 
 // Dictionary for multi-language translation (Req 34)
@@ -1275,7 +1276,7 @@ function setupEventListeners() {
         if (!exists) {
           checkbox.disabled = true;
           try {
-            const request = await window.api.resolveIconRequest({ path, name });
+            const request = await window.api.resolveIconRequest({ path, name, args: '' });
             const iconResult = await window.api.getFileIcon(request);
             const item = {
               id: 'win-app-' + path.replace('.', '-') + '-' + Date.now(),
@@ -1353,19 +1354,23 @@ function setupEventListeners() {
     try {
       let repaired = 0;
       let failed = 0;
-      for (let i = 0; i < config.items.length; i++) {
-        const item = config.items[i];
-        try {
-          const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
-          const iconResult = await window.api.getFileIcon(request, true);
-          applyIconMetadata(item, request, iconResult);
-          if (iconResult && iconResult.fallback === false) repaired++;
-          else failed++;
-        } catch (err) {
-          failed++;
-          console.error('Failed to repair icon:', item.name, err);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < config.items.length) {
+          const item = config.items[cursor++];
+          try {
+            const request = await window.api.resolveIconRequest(iconRequestFromItem(item));
+            const iconResult = await window.api.getFileIcon(request, true);
+            applyIconMetadata(item, request, iconResult);
+            if (iconResult && iconResult.fallback === false) repaired++;
+            else failed++;
+          } catch (err) {
+            failed++;
+            console.error('Failed to repair icon:', item.name, err);
+          }
         }
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, config.items.length) }, () => worker()));
       if (!await persistSettingsConfig({ rollbackTo: before })) return;
       const result = failed > 0
         ? t.msg_repair_partial.replace('{repaired}', repaired).replace('{failed}', failed)
