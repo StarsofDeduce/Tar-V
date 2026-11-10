@@ -3,7 +3,7 @@ let config = null;
 let originalConfigStr = '';
 let deadItemsList = [];
 let persistedConfig = null;
-const ICON_EXTRACTOR_VERSION = 3;
+const ICON_EXTRACTOR_VERSION = 4;
 
 function cloneConfig(value) {
   return JSON.parse(JSON.stringify(value));
@@ -11,6 +11,7 @@ function cloneConfig(value) {
 
 function iconRequestFromItem(item) {
   return {
+    name: item.name || '',
     path: item.path || '',
     shortcutPath: item.shortcutPath || '',
     iconPath: item.iconPath || '',
@@ -20,7 +21,7 @@ function iconRequestFromItem(item) {
 
 function applyIconMetadata(item, request, iconResult = null) {
   item.icon = '';
-  item.shortcutPath = request.shortcutPath || '';
+  if (!request.inferredShortcutPath) item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
   item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
@@ -1274,7 +1275,7 @@ function setupEventListeners() {
         if (!exists) {
           checkbox.disabled = true;
           try {
-            const request = await window.api.resolveIconRequest({ path });
+            const request = await window.api.resolveIconRequest({ path, name });
             const iconResult = await window.api.getFileIcon(request);
             const item = {
               id: 'win-app-' + path.replace('.', '-') + '-' + Date.now(),

@@ -200,6 +200,12 @@ test('PowerShell 包装关闭进度流并输出 UTF-8 Base64 错误信封', () =
   assert.strictEqual(decodePowerShellError(`${ERROR_ENVELOPE_PREFIX}${encoded}`), '中文错误');
 });
 
+test('PowerShell 包装不缩进 here-string 结束符', () => {
+  const wrapped = wrapPowerShellScript("Add-Type -TypeDefinition @'\npublic class TarVProbe {}\n'@;");
+  assert.ok(wrapped.includes("\n'@;\n"));
+  assert.ok(!wrapped.includes("\n  '@;"));
+});
+
 test('CLIXML 不直接进入用户提示', () => {
   const decoded = decodePowerShellError('#< CLIXML\r\n<Objs><S S="Error">乱码</S></Objs>');
   assert.strictEqual(decoded, 'PowerShell 操作失败');
@@ -465,6 +471,21 @@ test('Antigravity 旧路径能匹配唯一高可信开始菜单候选', () => {
   };
   assert.ok(scoreRepairCandidate(item, candidate) >= 120);
   assert.strictEqual(chooseUniqueRepairCandidate(item, [candidate]).target, candidate.target);
+});
+
+test('Discord Update 启动器可借用开始菜单中的显式 app.ico', () => {
+  const item = {
+    name: 'Discord',
+    path: 'C:\\Users\\me\\AppData\\Local\\Discord\\Update.exe'
+  };
+  const candidate = {
+    name: 'Discord',
+    target: 'C:\\Users\\me\\AppData\\Local\\Discord\\Update.exe',
+    shortcutPath: 'C:\\Users\\me\\Start Menu\\Discord.lnk',
+    iconPath: 'C:\\Users\\me\\AppData\\Local\\Discord\\app.ico'
+  };
+  const selected = chooseUniqueRepairCandidate(item, [candidate]);
+  assert.strictEqual(selected.iconPath, candidate.iconPath);
 });
 
 test('多个同分高可信候选时不自动提出修复', () => {

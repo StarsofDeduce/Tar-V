@@ -6,7 +6,7 @@ let isBatchMode = false;
 let selectedItemsForBatch = new Set();
 let draggedItemId = null;
 let draggedTabId = null;
-const ICON_EXTRACTOR_VERSION = 3;
+const ICON_EXTRACTOR_VERSION = 4;
 const runtimeIconCache = new Map();
 const runtimeIconLoads = new Map();
 let persistedConfig = null;
@@ -27,6 +27,7 @@ function isProtocolPath(value) {
 
 function iconRequestFromItem(item) {
   return {
+    name: item.name || '',
     path: item.path || '',
     shortcutPath: item.shortcutPath || '',
     iconPath: item.iconPath || '',
@@ -35,7 +36,7 @@ function iconRequestFromItem(item) {
 }
 
 function applyIconMetadata(item, request, iconResult = null) {
-  item.shortcutPath = request.shortcutPath || '';
+  if (!request.inferredShortcutPath) item.shortcutPath = request.shortcutPath || '';
   item.iconPath = request.iconPath || '';
   item.iconIndex = Number.isInteger(request.iconIndex) ? request.iconIndex : 0;
   item.iconVersion = iconResult && iconResult.fallback === false ? ICON_EXTRACTOR_VERSION : 0;
@@ -588,6 +589,7 @@ async function manuallyRelocateItem(itemId) {
   }
 
   const iconRequest = await window.api.resolveIconRequest({
+    name: draftItem.name,
     path: targetPath,
     shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
     iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
@@ -1460,6 +1462,7 @@ async function batchImportFolder() {
 
     const itemId = 'item-batch-' + Date.now() + '-' + i + '-' + Math.floor(Math.random()*1000);
     const iconRequest = await window.api.resolveIconRequest({
+      name,
       path: finalPath,
       shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
       iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
@@ -1540,6 +1543,7 @@ async function saveItemDetails() {
   }
 
   const iconRequest = await window.api.resolveIconRequest({
+    name,
     path: targetPath,
     shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
     iconPath: shortcutDetails ? shortcutDetails.iconPath : '',
@@ -1942,6 +1946,7 @@ function setupEventListeners() {
 
       const itemId = 'item-drop-' + Date.now() + '-' + i + '-' + Math.floor(Math.random() * 1000);
       const iconRequest = await window.api.resolveIconRequest({
+        name: dispName,
         path: targetPath,
         shortcutPath: shortcutDetails ? shortcutDetails.shortcutPath : '',
         iconPath: shortcutDetails ? shortcutDetails.iconPath : '',

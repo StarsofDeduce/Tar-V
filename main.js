@@ -853,6 +853,21 @@ function enrichIconRequest(input) {
   let details = sourcePath ? resolveShortcutFile(sourcePath) : null;
   if (!details && steamAppId(request.path)) details = findSteamShortcut(request.path);
 
+  // Old configurations did not preserve shortcutPath. Recover an icon source
+  // by matching only Start Menu/Desktop shortcuts, but mark it as inferred so
+  // the renderer never turns an icon lookup into a silent launch-path repair.
+  const canInferByName = typeof request.name === 'string' && request.name.length > 0 && request.name.length <= 256;
+  if (!details && canInferByName && request.path && !isProtocolTarget(request.path)) {
+    const candidate = chooseUniqueRepairCandidate(
+      { name: request.name, path: request.path },
+      getRepairShortcutCandidates()
+    );
+    if (candidate) {
+      details = candidate;
+      request.inferredShortcutPath = true;
+    }
+  }
+
   if (details) {
     request.path = details.target || request.path;
     request.shortcutPath = details.shortcutPath || sourcePath;
