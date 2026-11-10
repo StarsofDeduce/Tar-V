@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.0-61269C?style=flat-square" alt="Version 2.0.0">
+  <img src="https://img.shields.io/badge/version-2.0.1-61269C?style=flat-square" alt="Version 2.0.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=flat-square&logo=windows" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/framework-Electron-47848F?style=flat-square&logo=electron" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License">
@@ -25,6 +25,21 @@
 Tar V is a local quick-launch panel built for Windows. It brings applications, Steam games, files, folders, URLs, and shortcuts into a panel that is always one hotkey away, instead of leaving frequently used items scattered across the desktop, Start menu, and nested folders.
 
 Open Tar V with a global hotkey, browse groups or search, and launch an item directly. The panel supports drag-and-drop, group management, batch editing, elevated launch, automatic hiding, and several keyboard and mouse navigation options. Configuration and icon caches stay on the local computer; no account or cloud service is required.
+
+## What's new in 2.0.1
+
+Version 2.0.1 focuses on reliable imports and launching, correct Windows icons, bounded background refreshes, and clearer context menus and errors.
+
+- Fixed dropped, batch-imported, and manually added entries appearing before persistence succeeded, disappearing after restart, or failing to launch.
+- Shortcuts retain their original source and are resolved again before launch. Missing targets can be repaired from a high-confidence candidate only after user confirmation.
+- Directories always use the current Windows folder-type icon; names and executables inside a directory no longer change its type.
+- Improved `.exe`, `.lnk`, `.url`, resource-index, and Squirrel.Windows icon resolution, including apps that use `Update.exe --processStart`, such as Discord.
+- Icon caches use the complete item source so applications, folders, or paths with similar names cannot share an unrelated icon.
+- Background migration deduplicates requests and commits icon metadata only, avoiding repeated full-configuration writes and concurrent edit loss.
+- Unified item, group, and background context menus with no Emoji, plus keyboard navigation, focus restoration, and distinct destructive actions.
+- Launch failures now use structured, readable messages; raw PowerShell and CLIXML error streams are kept out of the interface.
+- Settings save as one transaction. A failed hotkey or autostart update restores both the system state and configuration.
+- Icon request, cache-record, and data-URL sizes are bounded to reduce memory and disk pressure from abnormal files.
 
 ## What's new in 2.0.0
 
@@ -147,16 +162,16 @@ Tar V 2.0.0 is a broad revision of icon compatibility, settings, performance, an
 
 ### Install
 
-1. Download `Tar V Setup 2.0.0.exe` from [Releases](../../releases).
+1. Download `Tar V Setup 2.0.1.exe` from [Releases](../../releases).
 2. Run the installer and select an installation directory.
 3. Choose whether to create Desktop and Start menu shortcuts.
 4. Start Tar V and configure the global hotkey and common entries in Settings.
 
 The NSIS installer supports a custom destination and registers Tar V in Windows Apps & Features.
 
-### Upgrade from 1.x
+### Upgrade from 2.0.0 or 1.x
 
-Version 2.0.0 supplies defaults for new settings while continuing to read existing groups and items. Export a JSON backup from “Backup and restore” before upgrading so you always have a recovery point.
+Version 2.0.1 preserves existing groups, items, and settings while removing confirmed obsolete experimental fields. Export a JSON backup from “Backup and restore” before upgrading so you always have a recovery point.
 
 ## Icon compatibility
 
@@ -186,7 +201,7 @@ Tar V launches local programs, resolves shortcuts, and reads icons, so it crosse
 | **File access** | Normalizes paths and enforces access boundaries around user-authorized files and directories. |
 | **Release audit** | Scans packaged content for local paths, credential patterns, and personal-data traces. |
 
-Please report security issues privately through GitHub Security Advisories. Do not publish directly exploitable details in a public issue.
+Do not publish directly exploitable security details in a public issue. Open an issue without technical details first to request a private communication channel with the maintainer.
 
 ## Local data and privacy
 
@@ -241,7 +256,7 @@ Default outputs:
 
 | File | Purpose |
 | :--- | :--- |
-| `dist/Tar V Setup 2.0.0.exe` | Windows x64 NSIS installer |
+| `dist/Tar V Setup 2.0.1.exe` | Windows x64 NSIS installer |
 | `dist/win-unpacked/Tar V.exe` | Unpacked build for local verification |
 
 Before a public release, complete the renderer regression, installation test, dependency audit, and packaged-content audit.

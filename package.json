@@ -1,6 +1,6 @@
 {
   "name": "tar-v",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A fast local launcher for Windows apps, games, files, and folders.",
   "main": "main.js",
   "scripts": {

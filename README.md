@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.0-61269C?style=flat-square" alt="Version 2.0.0">
+  <img src="https://img.shields.io/badge/version-2.0.1-61269C?style=flat-square" alt="Version 2.0.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=flat-square&logo=windows" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/framework-Electron-47848F?style=flat-square&logo=electron" alt="Electron">
   <img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License">
@@ -25,6 +25,21 @@
 Tar V 是一款面向 Windows 的本地快捷启动工具。它把应用、Steam 游戏、文件、文件夹、网址和快捷方式集中到一个可随时呼出的面板中，让常用内容不必散落在桌面、开始菜单和多级目录里。
 
 你可以通过全局快捷键打开 Tar V，按分组浏览或搜索项目，然后直接启动。面板支持拖放添加、标签管理、批量编辑、管理员启动、自动收起以及多种键鼠切换方式；所有配置与图标缓存均保存在本机，不需要账号或云端服务。
+
+## 2.0.1 维护更新
+
+2.0.1 集中修复导入启动、Windows 图标识别和后台刷新问题，并重新整理右键菜单与错误提示。
+
+- 修复拖入、批量导入和手动添加的项目在保存失败后仍显示于界面、重启后丢失或无法启动的问题。
+- 快捷方式会保留原始来源并在启动前重新解析；路径失效时可查找候选项目，经用户确认后再修复。
+- 目录始终使用 Windows 当前的文件夹类型图标，不再根据名称或目录内程序猜测图标。
+- 改进 `.exe`、`.lnk`、`.url`、资源索引和 Squirrel.Windows 应用的图标解析，适用于 Discord 等使用 `Update.exe --processStart` 的程序。
+- 图标缓存以完整项目来源区分，避免同名软件、同名文件夹或相似路径串用图标。
+- 后台迁移会合并重复请求，并只提交图标元数据，不再反复保存整份配置或覆盖同时进行的编辑。
+- 统一项目、标签和背景右键菜单，移除 Emoji，补充键盘导航、焦点恢复和危险操作样式。
+- 启动失败改为结构化中文提示；PowerShell 原始错误与 CLIXML 不再直接显示到界面。
+- 设置保存改为事务处理：快捷键或开机启动应用失败时，同时恢复系统状态与配置文件。
+- 限制图标输入、缓存记录和数据 URL 大小，降低异常文件导致内存或磁盘占用过高的风险。
 
 ## 2.0.0 重大更新
 
@@ -147,16 +162,16 @@ Tar V 2.0.0 不是简单的界面换色，而是围绕图标兼容、设置体�
 
 ### 安装
 
-1. 从 [Releases](../../releases) 下载 `Tar V Setup 2.0.0.exe`。
+1. 从 [Releases](../../releases) 下载 `Tar V Setup 2.0.1.exe`。
 2. 运行安装程序并选择安装目录。
 3. 根据需要创建桌面快捷方式和开始菜单快捷方式。
 4. 启动 Tar V，在设置中心配置全局快捷键和常用项目。
 
 安装包使用 NSIS 构建，支持自定义安装目录，并注册到 Windows 的应用卸载列表。
 
-### 从 1.x 升级
+### 从 2.0.0 或 1.x 升级
 
-2.0.0 会为新增设置补充默认值，并继续读取原有分组和项目。升级前仍建议先在“备份与恢复”中导出 JSON，以便随时恢复。
+2.0.1 会保留已有分组、项目和设置，并自动清理已废弃的实验设置字段。升级前仍建议先在“备份与恢复”中导出 JSON，以便随时恢复。
 
 ## 图标兼容说明
 
@@ -186,7 +201,7 @@ Tar V 需要启动本地程序、解析快捷方式和读取图标，因此会�
 | **文件访问** | 对路径进行规范化和边界检查，仅向已经授权的文件或目录开放相关操作。 |
 | **发行检查** | 扫描打包内容中的本机路径、凭据模式和个人信息特征。 |
 
-请通过 GitHub Security Advisory 私下报告安全问题；不要在公开 Issue 中发布可直接利用的细节。
+请不要在公开 Issue 中发布可直接利用的安全细节。可先提交一个不含漏洞细节的 Issue 请求与维护者建立私下沟通渠道。
 
 ## 本地数据与隐私
 
@@ -241,7 +256,7 @@ npm run audit:release
 
 | 文件 | 用途 |
 | :--- | :--- |
-| `dist/Tar V Setup 2.0.0.exe` | Windows x64 NSIS 安装程序 |
+| `dist/Tar V Setup 2.0.1.exe` | Windows x64 NSIS 安装程序 |
 | `dist/win-unpacked/Tar V.exe` | 用于本地验证的免安装构建 |
 
 正式发布前应同时完成界面回归、安装测试、依赖审计和发行包脱敏检查。
